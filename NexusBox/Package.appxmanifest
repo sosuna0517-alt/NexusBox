@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  IgnorableNamespaces="uap mp rescap desktop">
+
+  <Identity Name="NexusBox" Publisher="CN=NexusBox" Version="0.1.0.0" ProcessorArchitecture="*"/>
+  <mp:PhoneIdentity PhoneProductId="8f4c3a2b-0000-4f0d-9a1e-2b6c7d8e9f01" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
+
+  <Properties>
+    <DisplayName>NexusBox</DisplayName>
+    <PublisherDisplayName>NexusBox</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <!-- Dev Mode: allow the app to be resumed/killed by the system shell gracefully -->
+    <desktop:ExecutionAlias Alias="nexusbox.exe"/>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26100.0"/>
+    <!-- Xbox (Xbox One / Series X|S) device family -->
+    <TargetDeviceFamily Name="Windows.Xbox" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26100.0"/>
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us"/>
+  </Resources>
+
+  <Applications>
+    <Application Id="App" StartPage="NexusBox.App">
+      <uap:VisualElements
+        DisplayName="NexusBox"
+        Square150x150Logo="Assets\Logo150.png"
+        Square44x44Logo="Assets\Logo44.png"
+        Description="Native libretro-compatible emulator frontend for Xbox"
+        BackgroundColor="#101018">
+        <uap:DefaultTile Wide310x150Logo="Assets\WideLogo.png"/>
+        <uap:SplashScreen Image="Assets\Splash.png"/>
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Xbox: allow full-trust-ish behavior needed for D3D12 debug layers & sockets -->
+        <desktop:Extension Category="windows.fullTrustProcess" Executable="NexusBox.exe"/>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="internetClient"/>
+    <!-- ROM access on the local console (isolated storage + user folders) -->
+    <uap:Capability Name="musicLibrary"/>
+    <uap:Capability Name="videosLibrary"/>
+    <uap:Capability Name="picturesLibrary"/>
+    <!-- USB ROM drives: NTFS/exFAT auto-mount via KnownFolders::RemovableDevices -->
+    <uap:Capability Name="removableStorage"/>
+    <!-- Required to open arbitrary paths for external ROM collections -->
+    <rescap:Capability Name="broadFileSystemAccess"/>
+    <!-- Keep running when the shell would normally suspend (autosave/SRAM flush) -->
+    <rescap:Capability Name="extendedExecutionUnconstrained"/>
+    <!-- Raw sockets for peer-to-peer netplay -->
+    <DeviceCapability Name="067e3ee1-1d1c-4bc2-9d09-85b23a55d1f3"/>
+  </Capabilities>
+</Package>

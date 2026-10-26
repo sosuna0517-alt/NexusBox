@@ -1,0 +1,43 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Header / syntax sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trailing-whitespace & EOF newline check
+        run: |
+          # Fail on trailing whitespace in tracked source files (ignores assets).
+          find src -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hlsl' \) \
+            | xargs -I{} sh -c 'grep -nP "[ \t]+$" "$1" && exit 1 || true' _ {}
+
+  build-windows-uwp:
+    name: Windows (UWP, Xbox Dev Mode) — pure C++, no package manager
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        preset: [win-x64, win-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Visual Studio generator, UWP)
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --config Release
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusBox-${{ matrix.preset }}
+          path: |
+            build/**/*.exe
+            build/**/*.pdb
+            NexusBox/Package.appxmanifest

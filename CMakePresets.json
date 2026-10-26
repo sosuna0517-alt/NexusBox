@@ -1,0 +1,57 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "installDir": "${sourceDir}/build/${presetName}/install",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "WindowsStore",
+        "CMAKE_SYSTEM_VERSION": "10.0",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "win-x64",
+      "inherits": "base",
+      "displayName": "NexusBox x64 (VS 2026, UWP)",
+      "description": "Visual Studio generator — does not need rc.exe/mt.exe on PATH. Series X/S main target.",
+      "generator": "Visual Studio 18 2026",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/Cache/1.0": {
+          "operatingSystem": "Windows",
+          "osMacros": [ "windows" ]
+        }
+      }
+    },
+    {
+      "name": "win-arm64",
+      "inherits": "base",
+      "displayName": "NexusBox ARM64 (VS 2026, UWP)",
+      "generator": "Visual Studio 18 2026",
+      "architecture": { "value": "ARM64", "strategy": "set" }
+    },
+    {
+      "name": "win-x64-release",
+      "inherits": "win-x64",
+      "displayName": "NexusBox x64 Release (VS 2026, UWP)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "win-x64-vs2022",
+      "inherits": "base",
+      "displayName": "NexusBox x64 (VS 2022, UWP) — legacy fallback",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "win-x64", "configurePreset": "win-x64", "configuration": "Debug" },
+    { "name": "win-x64-release", "configurePreset": "win-x64-release", "configuration": "Release" },
+    { "name": "win-arm64", "configurePreset": "win-arm64", "configuration": "Debug" },
+    { "name": "win-x64-vs2022", "configurePreset": "win-x64-vs2022", "configuration": "Debug" }
+  ]
+}

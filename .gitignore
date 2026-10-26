@@ -1,0 +1,39 @@
+# Build output
+build/
+out/
+x64/
+ARM64/
+*.user
+*.aps
+*.VC.db
+*.VC.opendb
+.vs/
+ipch/
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# UWP packaging output
+AppPackages/
+bundleart/
+*.appx
+*.appxbundle
+*.msixupload
+*.appxupload
+bin/
+obj/
+
+# Libretro cores / ROMs / user content (never commit these)
+*.dll
+cores/
+roms/
+system/
+saves/
+
+# Media caches
+media/
+
+# Local junk
+Thumbs.db
+Desktop.ini
