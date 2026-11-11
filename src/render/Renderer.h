@@ -1,87 +1,98 @@
 #pragma once
-// Renderer.h — D3D12 presentation pipeline.
-// - Flip-discard swapchain, 4K/120Hz, VRR (DXGI_FEATURE_PRESENT_ALLOW_TEARING),
-//   DXGI Low Latency Mode via D3D12 with variable refresh.
-// - Core video is uploaded as a R8G8B8A8_UNORM (or 16BPPP for hi-color cores)
-//   texture ring; blit queue scales: Nearest / Bilinear / Integer.
-// - Post-processing chain: per-pass root signature + PSO cache for Slang/HLSL
-//   (CRT-Royale, scanlines). Passes are rebuilt only when settings change.
+// Renderer.h — D3D12 presentation for Xbox (UWP CoreWindow swapchain).
+// One frame in flight: each Render() records clear -> game video -> ImGui UI,
+// presents, then waits for the GPU. Simple, robust, and latency stays low
+// because the swapchain only has two buffers.
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
-#include <memory>
-#include <array>
+#include <cstdint>
 #include <mutex>
+#include <vector>
 
 #include <winrt/Windows.UI.Core.h>
 
+struct ImDrawData;
+
 namespace nb {
-
-struct VideoGeometry
-{
-    uint32_t srcW = 0, srcH = 0;
-    double   aspect = 4.0 / 3.0;     // from retro_get_system_av_info
-    float    rotation = 0.0f;
-};
-
-struct VideoFrame
-{
-    const void*  data = nullptr;      // core-owned, valid until next retro_run
-    uint32_t     pitch = 0;           // bytes
-    uint32_t     width = 0, height = 0;
-    uint32_t     bitsPerPixel = 32;
-    uint64_t     frameIndex = 0;
-};
 
 enum class ScaleMode { Nearest, Bilinear, Integer };
 
 class Renderer
 {
 public:
-    void Initialize(winrt::Windows::UI::Core::CoreWindow const& window);
+    bool Initialize(winrt::Windows::UI::Core::CoreWindow const& window);
     void Shutdown();
 
-    // Called from the emulation thread: queues an upload + scale + present-ready
-    // fence signal. Never blocks; uses a 3-slot texture ring.
-    void Blit(const VideoFrame& frame, const VideoGeometry& geo, uint64_t frameIndex);
+    // Emulation thread: hands over the latest XRGB8888 frame (copied).
+    void SubmitVideo(const uint32_t* xrgb, uint32_t width, uint32_t height, double aspect);
+    void ClearVideo();
 
-    // Called from the UI thread.
-    void Present();
-    void OnResize(uint32_t w, uint32_t h);
-    void HandleDeviceLost();
+    // UI thread: draw everything and present.
+    void Render(ImDrawData* ui);
 
-    void SetScaleMode(ScaleMode m);
-    void SetVsync(bool on);                    // off => tearing allowed (VRR)
-    void SetLowLatencyMode(bool on);           // D3D12 low-latency present
-    void SetPostChain(const char* shaderName); // "scanlines" | "crt-royale" | nullptr
+    // ImGui font atlas upload (call after ImGui::CreateContext()).
+    bool InitImGui();
+
+    void SetScaleMode(ScaleMode m) { m_scale = m; }
+    ScaleMode GetScaleMode() const { return m_scale; }
+    void SetVsync(bool on)         { m_vsync = on; }
+    bool GetVsync() const          { return m_vsync; }
+
+    uint32_t Width()  const { return m_width; }
+    uint32_t Height() const { return m_height; }
+    bool     Ok()     const { return m_ok; }
 
 private:
-    void CreateDeviceAndSwapchain();
-    void CreateUploadRing();
-    void CreateBlitPipeline();
+    bool CreateDevice();
+    bool CreateSwapchain(winrt::Windows::UI::Core::CoreWindow const& window);
+    bool CreatePipelines();
     void WaitForGpu();
-    uint32_t RingSlot(uint64_t i) const { return (uint32_t)(i % 3); }
+    void UploadVideoIfDirty();
+    void DrawVideo();
+    void DrawImGui(ImDrawData* dd);
+    void Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
+    Microsoft::WRL::ComPtr<ID3D12Resource> CreateBuffer(D3D12_HEAP_TYPE heap, UINT64 size, D3D12_RESOURCE_STATES state);
+    Microsoft::WRL::ComPtr<ID3D12Resource> CreateTexture(UINT w, UINT h, DXGI_FORMAT fmt);
 
-    Microsoft::WRL::ComPtr<ID3D12Device>        m_device;
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue>  m_queue;
-    Microsoft::WRL::ComPtr<IDXGISwapChain4>     m_swapchain;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>   m_alloc;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_cmd;
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSig;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_psos[3]; // per ScaleMode
-    Microsoft::WRL::ComPtr<ID3D12Resource>      m_rtv[2];
-    Microsoft::WRL::ComPtr<ID3D12Resource>      m_videoTex[3]; // 3-slot ring
-    Microsoft::WRL::ComPtr<ID3D12Resource>      m_upload[3];
+    template <class T> using ComPtr = Microsoft::WRL::ComPtr<T>;
+    static constexpr UINT kBackBuffers = 2;
 
-    HANDLE m_fenceEvent = nullptr;
-    Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
-    uint64_t m_fenceValue = 0;
-    UINT     m_backBuffer = 0;
+    ComPtr<IDXGIFactory4>             m_factory;
+    ComPtr<ID3D12Device>              m_device;
+    ComPtr<ID3D12CommandQueue>        m_queue;
+    ComPtr<IDXGISwapChain3>           m_swapchain;
+    ComPtr<ID3D12CommandAllocator>    m_alloc;
+    ComPtr<ID3D12GraphicsCommandList> m_cmd;
+    ComPtr<ID3D12DescriptorHeap>      m_rtvHeap;
+    ComPtr<ID3D12DescriptorHeap>      m_srvHeap;   // [0] font, [1] video
+    ComPtr<ID3D12Resource>            m_backBuffers[kBackBuffers];
+    UINT                              m_rtvStride = 0, m_srvStride = 0;
 
+    ComPtr<ID3D12RootSignature>       m_rootSig;
+    ComPtr<ID3D12PipelineState>       m_blitPso, m_uiPso;
+
+    ComPtr<ID3D12Fence>               m_fence;
+    HANDLE                            m_fenceEvent = nullptr;
+    UINT64                            m_fenceValue = 0;
+
+    // Video texture + staging
+    ComPtr<ID3D12Resource>            m_videoTex, m_videoUpload;
+    uint32_t                          m_texW = 0, m_texH = 0;
+    std::mutex                        m_videoMutex;
+    std::vector<uint32_t>             m_videoPixels;
+    uint32_t                          m_videoW = 0, m_videoH = 0;
+    double                            m_videoAspect = 4.0 / 3.0;
+    bool                              m_videoDirty = false, m_hasVideo = false;
+
+    // ImGui resources
+    ComPtr<ID3D12Resource>            m_fontTex;
+    ComPtr<ID3D12Resource>            m_uiVB, m_uiIB;
+    UINT64                            m_uiVBSize = 0, m_uiIBSize = 0;
+
+    uint32_t  m_width = 1920, m_height = 1080;
     ScaleMode m_scale = ScaleMode::Integer;
-    bool      m_vsync = true;
-    bool      m_lowLatency = true;
-    std::mutex m_gpuMutex;   // serializes Blit vs Present against the fence
+    bool      m_vsync = true, m_tearing = false, m_ok = false;
 };
 
 } // namespace nb

@@ -26,7 +26,8 @@ obj/
 
 # Libretro cores / ROMs / user content (never commit these)
 *.dll
-cores/
+cores/*
+!cores/README.md
 roms/
 system/
 saves/

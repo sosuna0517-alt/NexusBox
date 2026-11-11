@@ -48,9 +48,6 @@ public:
     // Called from the emulation thread: consistent, non-blocking snapshot.
     std::array<PadState, kMaxPads> Snapshot(uint64_t frame);
 
-    // Called from the UI thread.
-    void ProcessHotkeys(CoreEngine& engine);
-
     void SetDeadzone(float radial)        { m_deadzone = radial; }
     void SetRemap(const char* json);      // per-core profile
     void SetHotkeyPadCombo(uint16_t btnMask, HotkeyEvent::Action a);

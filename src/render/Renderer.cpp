@@ -1,343 +1,504 @@
-// Renderer.cpp — D3D12 pipeline (foundation build: blit + scaling + one post pass).
+// Renderer.cpp — D3D12 clear + game blit + ImGui, presented on the CoreWindow.
 #include "Renderer.h"
 
-#include <winrt/Windows.UI.Core.h>
-#include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
-#include "d3dx12.h"
+#include <cmath>
 
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
+#ifdef NEXUSBOX_HAS_IMGUI
+#include "imgui.h"
+#endif
+
+// Shader bytecode compiled at build time by FXC (see CMakeLists.txt).
+#include "BlitVS.h"
+#include "BlitPS.h"
+#include "ImGuiVS.h"
+#include "ImGuiPS.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace nb
 {
 
-static const char* g_vsQuad = R"HLSL(
-struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
-VSOut main(uint vid : SV_VertexID)
-{
-    // Fullscreen triangle strip from vertex ID (no vertex buffer, no cost).
-    VSOut o;
-    float2 p = float2((vid == 1) ? 3.0 : -1.0, (vid == 2) ? 3.0 : -1.0);
-    o.pos = float4(p, 0, 1);
-    o.uv  = float2((p.x + 1) * 0.5, 1 - (p.y + 1) * 0.5);
-    return o;
-}
-)HLSL";
+static void Debug(const char* msg) { OutputDebugStringA("[NexusBox] "); OutputDebugStringA(msg); OutputDebugStringA("\n"); }
 
-static const char* g_psBlit[3] = {
-    // Nearest
-    R"HLSL(
-Texture2D src : register(t0); SamplerState s : register(s0);
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target
-{ return src.SampleLevel(s, uv, 0); }   // POINT sampler bound for slot 0
-)HLSL",
-    // Bilinear
-    R"HLSL(
-Texture2D src : register(t0); SamplerState s : register(s0);
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target
-{ return src.SampleLevel(s, uv, 0); }   // LINEAR sampler for slot 1
-)HLSL",
-    // Integer scale: snap the viewport to whole multiples in the VS-side rect,
-    // then point-sample. Overscan is letterboxed on the swapchain RTV.
-    R"HLSL(
-Texture2D src : register(t0); SamplerState s : register(s0);
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target
-{ return src.SampleLevel(s, uv, 0); }   // integer rect computed on CPU
-)HLSL"
-};
-
-void Renderer::Initialize(winrt::Windows::UI::Core::CoreWindow const& window)
+bool Renderer::Initialize(winrt::Windows::UI::Core::CoreWindow const& window)
 {
-    CreateDeviceAndSwapchain();
-    CreateUploadRing();
-    CreateBlitPipeline();
-    (void)window;
+    m_ok = CreateDevice() && CreateSwapchain(window) && CreatePipelines();
+    if (!m_ok) Debug("Renderer initialization failed");
+    return m_ok;
 }
 
-void Renderer::CreateDeviceAndSwapchain()
+bool Renderer::CreateDevice()
 {
     UINT flags = 0;
 #ifndef NDEBUG
+    ComPtr<ID3D12Debug> dbg;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
     flags |= DXGI_CREATE_FACTORY_DEBUG;
 #endif
-    ComPtr<IDXGIFactory6> factory;
-    CreateDXGIFactory2(flags, IID_PPV_ARGS(factory.ReleaseAndGetAddressOf()));
+    if (FAILED(CreateDXGIFactory2(flags, IID_PPV_ARGS(&m_factory))))
+        if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&m_factory)))) return false;
 
-    ComPtr<IDXGIAdapter1> adapter;
-    factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                                        IID_PPV_ARGS(adapter.ReleaseAndGetAddressOf()));
-
-    // Series X/S exposes FL 12.x; request 12.0 baseline (12.2 features opt-in).
-    D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0,
-                      IID_PPV_ARGS(m_device.ReleaseAndGetAddressOf()));
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device))))
+    { Debug("D3D12CreateDevice failed"); return false; }
 
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;   // presentation above compute
-    m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(m_queue.ReleaseAndGetAddressOf()));
+    if (FAILED(m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue)))) return false;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_alloc)))) return false;
+    if (FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_alloc.Get(), nullptr, IID_PPV_ARGS(&m_cmd)))) return false;
+    m_cmd->Close();
+
+    if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) return false;
+    m_fenceEvent = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+
+    D3D12_DESCRIPTOR_HEAP_DESC rh{};
+    rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rh.NumDescriptors = kBackBuffers;
+    if (FAILED(m_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&m_rtvHeap)))) return false;
+    m_rtvStride = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    D3D12_DESCRIPTOR_HEAP_DESC sh{};
+    sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    sh.NumDescriptors = 2;
+    sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(m_device->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&m_srvHeap)))) return false;
+    m_srvStride = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return true;
+}
+
+bool Renderer::CreateSwapchain(winrt::Windows::UI::Core::CoreWindow const& window)
+{
+    ComPtr<IDXGIFactory5> f5;
+    BOOL allowTearing = FALSE;
+    if (SUCCEEDED(m_factory.As(&f5)))
+        f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing));
+    m_tearing = allowTearing == TRUE;
+
+    // Xbox UWP apps render at 1920x1080; the console scales to the TV mode.
+    m_width = 1920; m_height = 1080;
 
     DXGI_SWAP_CHAIN_DESC1 sc{};
-    sc.Width  = 3840;                 // Series X|S native 4K
-    sc.Height = 2160;
-    sc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sc.Stereo = FALSE;
+    sc.Width = m_width;
+    sc.Height = m_height;
+    sc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sc.SampleDesc.Count = 1;
     sc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sc.BufferCount = 2;               // flip-discard with 2: lowest latency
+    sc.BufferCount = kBackBuffers;
     sc.Scaling = DXGI_SCALING_STRETCH;
     sc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    sc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING |   // VRR
-               DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    sc.Flags = m_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     ComPtr<IDXGISwapChain1> sc1;
-    factory->CreateSwapChainForCoreWindow(m_queue.Get(),
-        (IUnknown*)winrt::get_abi(
-            winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread()),
-        &sc, nullptr, sc1.ReleaseAndGetAddressOf());
-    sc1.As(&m_swapchain);
+    HRESULT hr = m_factory->CreateSwapChainForCoreWindow(m_queue.Get(),
+        static_cast<IUnknown*>(winrt::get_abi(window)), &sc, nullptr, &sc1);
+    if (FAILED(hr)) { Debug("CreateSwapChainForCoreWindow failed"); return false; }
+    if (FAILED(sc1.As(&m_swapchain))) return false;
 
-    // VRR + Low Latency: Series X|S supports variable refresh in Dev Mode builds.
-    ComPtr<IDXGIOutput> output;
-    m_swapchain->GetContainingOutput(output.ReleaseAndGetAddressOf());
-    ComPtr<IDXGIOutput6> output6;
-    if (SUCCEEDED(output.As(&output6)))
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < kBackBuffers; ++i)
     {
-        DXGI_OUTPUT_DESC1 d{};
-        if (SUCCEEDED(output6->GetDesc1(&d)))
-        {
-            // sc.Flags already allows tearing; HDR passthrough is future work.
-            (void)d;
-        }
+        if (FAILED(m_swapchain->GetBuffer(i, IID_PPV_ARGS(&m_backBuffers[i])))) return false;
+        m_device->CreateRenderTargetView(m_backBuffers[i].Get(), nullptr, rtv);
+        rtv.ptr += m_rtvStride;
     }
-    m_swapchain->SetMaximumFrameLatency(1);           // one frame of queue
-    m_fenceEvent = m_swapchain->GetFrameLatencyWaitableObject();
-
-    m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_fence.ReleaseAndGetAddressOf()));
-
-    m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(m_alloc.ReleaseAndGetAddressOf()));
-    m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_alloc.Get(),
-                                nullptr, IID_PPV_ARGS(m_cmd.ReleaseAndGetAddressOf()));
-    m_cmd->Close();
-
-    for (UINT i = 0; i < 2; ++i)
-    {
-        m_swapchain->GetBuffer(i, IID_PPV_ARGS(m_rtv[i].ReleaseAndGetAddressOf()));
-        // RTV creation handled by a desc heap in the full build; kept minimal here.
-    }
-    m_backBuffer = 0;
+    return true;
 }
 
-void Renderer::CreateUploadRing()
+bool Renderer::CreatePipelines()
 {
-    // Three R8G8B8A8 slots, 1920x1080 max core resolution (enlarged on demand).
-    D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
-    D3D12_HEAP_PROPERTIES upheap{ D3D12_HEAP_TYPE_UPLOAD };
-    D3D12_RESOURCE_DESC tex{};
-    tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    tex.Width = 1920; tex.Height = 1080; tex.DepthOrArraySize = 1;
-    tex.MipLevels = 1; tex.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    tex.SampleDesc.Count = 1;
-
-    D3D12_RESOURCE_DESC buf = tex;
-    buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buf.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-
-    for (int i = 0; i < 3; ++i)
-    {
-        m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(m_videoTex[i].ReleaseAndGetAddressOf()));
-        // Upload buffer sized once; cores rarely exceed 1080p wide.
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-        UINT64 sz = 0;
-        m_device->GetCopyableFootprints(&tex, 0, 1, 0, &fp, nullptr, nullptr, &sz);
-        D3D12_RESOURCE_DESC ub{};
-        ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        ub.Width = sz; ub.Height = 1; ub.DepthOrArraySize = 1; ub.MipLevels = 1;
-        ub.SampleDesc.Count = 1; ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        m_device->CreateCommittedResource(&upheap, D3D12_HEAP_FLAG_NONE, &ub,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(m_upload[i].ReleaseAndGetAddressOf()));
-    }
-}
-
-void Renderer::CreateBlitPipeline()
-{
+    // Root signature shared by the blit and UI passes:
+    //   [0] 17 root constants (b0): float4x4 projection + uint linear flag
+    //   [1] SRV table (t0)
+    //   static samplers s0 = point, s1 = linear
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1; range.BaseShaderRegister = 0;
+    range.NumDescriptors = 1;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER rp{};
-    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp.DescriptorTable.NumDescriptorRanges = 1;
-    rp.DescriptorTable.pDescriptorRanges = &range;
-    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 17;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &range;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    D3D12_STATIC_SAMPLER_DESC sp{};
-    sp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    sp.ShaderRegister = 0; sp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    D3D12_STATIC_SAMPLER_DESC sl = sp;
-    sl.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-
-    D3D12_STATIC_SAMPLER_DESC samps[2] = { sp, sl };
+    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+    for (int i = 0; i < 2; ++i)
+    {
+        samplers[i].Filter = i == 0 ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[i].ShaderRegister = (UINT)i;
+        samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        samplers[i].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    }
 
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 1; rs.pParameters = &rp;
-    rs.NumStaticSamplers = 2; rs.pStaticSamplers = samps;
+    rs.NumParameters = 2; rs.pParameters = params;
+    rs.NumStaticSamplers = 2; rs.pStaticSamplers = samplers;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
-    ComPtr<ID3DBlob> sig, err;
-    D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, sig.ReleaseAndGetAddressOf(), err.ReleaseAndGetAddressOf());
-    m_device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
-                                  IID_PPV_ARGS(m_rootSig.ReleaseAndGetAddressOf()));
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)))
+    { Debug(err ? (const char*)err->GetBufferPointer() : "root signature serialize failed"); return false; }
+    if (FAILED(m_device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&m_rootSig))))
+        return false;
 
-    // Compile the three pixel-shader variants (point/linear/integer) + shared VS.
-    for (int i = 0; i < 3; ++i)
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = m_rootSig.Get();
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+
+    // Game blit: no input layout, opaque.
+    pd.VS = { g_BlitVS, sizeof(g_BlitVS) };
+    pd.PS = { g_BlitPS, sizeof(g_BlitPS) };
+    if (FAILED(m_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_blitPso))))
+    { Debug("blit PSO failed"); return false; }
+
+    // ImGui: pos/uv/color vertices, alpha blending, scissor.
+    static const D3D12_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,   0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,   0, 8,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    pd.InputLayout = { layout, 3 };
+    pd.VS = { g_ImGuiVS, sizeof(g_ImGuiVS) };
+    pd.PS = { g_ImGuiPS, sizeof(g_ImGuiPS) };
+    auto& bt = pd.BlendState.RenderTarget[0];
+    bt.BlendEnable = TRUE;
+    bt.SrcBlend = D3D12_BLEND_SRC_ALPHA;   bt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA; bt.BlendOp = D3D12_BLEND_OP_ADD;
+    bt.SrcBlendAlpha = D3D12_BLEND_ONE;    bt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA; bt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    if (FAILED(m_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_uiPso))))
+    { Debug("ImGui PSO failed"); return false; }
+    return true;
+}
+
+ComPtr<ID3D12Resource> Renderer::CreateBuffer(D3D12_HEAP_TYPE heapType, UINT64 size, D3D12_RESOURCE_STATES state)
+{
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = heapType;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    d.Width = size; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> r;
+    m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r));
+    return r;
+}
+
+ComPtr<ID3D12Resource> Renderer::CreateTexture(UINT w, UINT h, DXGI_FORMAT fmt)
+{
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = w; d.Height = h; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.Format = fmt; d.SampleDesc.Count = 1;
+    ComPtr<ID3D12Resource> r;
+    m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&r));
+    return r;
+}
+
+void Renderer::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    m_cmd->ResourceBarrier(1, &b);
+}
+
+void Renderer::WaitForGpu()
+{
+    if (!m_queue || !m_fence) return;
+    const UINT64 v = ++m_fenceValue;
+    m_queue->Signal(m_fence.Get(), v);
+    if (m_fence->GetCompletedValue() < v)
     {
-        ComPtr<ID3DBlob> vs, ps;
-        D3DCompile(g_vsQuad, strlen(g_vsQuad), nullptr, nullptr, nullptr, "main",
-                   "vs_5_1", 0, 0, vs.ReleaseAndGetAddressOf(), err.ReleaseAndGetAddressOf());
-        D3DCompile(g_psBlit[i], strlen(g_psBlit[i]), nullptr, nullptr, nullptr, "main",
-                   "ps_5_1", 0, 0, ps.ReleaseAndGetAddressOf(), err.ReleaseAndGetAddressOf());
-
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
-        pso.pRootSignature = m_rootSig.Get();
-        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pso.DepthStencilState.DepthEnable = FALSE;
-        pso.SampleMask = UINT_MAX;
-        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pso.NumRenderTargets = 1;
-        pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso.SampleDesc.Count = 1;
-        m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(m_psos[i].ReleaseAndGetAddressOf()));
+        m_fence->SetEventOnCompletion(v, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, 2000);
     }
 }
 
-void Renderer::Blit(const VideoFrame& frame, const VideoGeometry& geo, uint64_t frameIndex)
-{
-    if (!frame.data || !frame.width) return;
-    const UINT slot = RingSlot(frame.frameIndex);
+// ------------------------------------------------------------------ video
 
-    m_cmd->Reset(m_alloc.Get(), m_psos[(int)m_scale].Get());
+void Renderer::SubmitVideo(const uint32_t* xrgb, uint32_t w, uint32_t h, double aspect)
+{
+    if (!xrgb || !w || !h) return;
+    std::lock_guard lock(m_videoMutex);
+    m_videoPixels.assign(xrgb, xrgb + (size_t)w * h);
+    m_videoW = w; m_videoH = h;
+    m_videoAspect = aspect > 0.0 ? aspect : (double)w / h;
+    m_videoDirty = true;
+}
+
+void Renderer::ClearVideo()
+{
+    std::lock_guard lock(m_videoMutex);
+    m_hasVideo = false;
+    m_videoDirty = false;
+}
+
+void Renderer::UploadVideoIfDirty()
+{
+    std::lock_guard lock(m_videoMutex);
+    if (!m_videoDirty) return;
+    m_videoDirty = false;
+
+    if (m_videoW != m_texW || m_videoH != m_texH || !m_videoTex)
+    {
+        // GPU is idle here (one frame in flight), so resources can be replaced.
+        m_videoTex = CreateTexture(m_videoW, m_videoH, DXGI_FORMAT_B8G8R8A8_UNORM);
+        const UINT64 rowPitch = (m_videoW * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(UINT64)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+        m_videoUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, rowPitch * m_videoH, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!m_videoTex || !m_videoUpload) { m_texW = m_texH = 0; return; }
+        m_texW = m_videoW; m_texH = m_videoH;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += m_srvStride;   // slot 1
+        m_device->CreateShaderResourceView(m_videoTex.Get(), &sv, h);
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    const D3D12_RESOURCE_DESC td = m_videoTex->GetDesc();
+    m_device->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
+
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE noRead{ 0, 0 };
+    if (FAILED(m_videoUpload->Map(0, &noRead, (void**)&mapped))) return;
+    for (uint32_t y = 0; y < m_videoH; ++y)
+        std::memcpy(mapped + fp.Footprint.RowPitch * y, m_videoPixels.data() + (size_t)y * m_videoW, (size_t)m_videoW * 4);
+    m_videoUpload->Unmap(0, nullptr);
+
+    Transition(m_videoTex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = m_videoTex.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = m_videoUpload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp;
+    m_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(m_videoTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_hasVideo = true;
+}
+
+void Renderer::DrawVideo()
+{
+    if (!m_hasVideo || !m_videoTex) return;
+
+    const float W = (float)m_width, H = (float)m_height;
+    const float aspect = (float)m_videoAspect;
+    float dh = H, dw = H * aspect;
+    if (dw > W) { dw = W; dh = W / aspect; }
+    if (m_scale == ScaleMode::Integer && m_texH > 0)
+    {
+        const float mult = std::max(1.0f, std::floor(dh / (float)m_texH));
+        dh = mult * (float)m_texH;
+        dw = dh * aspect;
+        if (dw > W) { dw = W; }
+    }
+    D3D12_VIEWPORT vp{ (W - dw) * 0.5f, (H - dh) * 0.5f, dw, dh, 0.0f, 1.0f };
+    D3D12_RECT sc{ 0, 0, (LONG)m_width, (LONG)m_height };
+
+    m_cmd->SetPipelineState(m_blitPso.Get());
+    uint32_t consts[17]{};
+    consts[16] = m_scale == ScaleMode::Bilinear ? 1u : 0u;
+    m_cmd->SetGraphicsRoot32BitConstants(0, 17, consts, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE srv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    srv.ptr += m_srvStride;
+    m_cmd->SetGraphicsRootDescriptorTable(1, srv);
+    m_cmd->RSSetViewports(1, &vp);
+    m_cmd->RSSetScissorRects(1, &sc);
+    m_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_cmd->DrawInstanced(3, 1, 0, 0);
+}
+
+// ------------------------------------------------------------------ ImGui
+
+bool Renderer::InitImGui()
+{
+#ifdef NEXUSBOX_HAS_IMGUI
+    if (!m_ok) return false;
+    ImGuiIO& io = ImGui::GetIO();
+    unsigned char* pixels = nullptr; int w = 0, h = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+
+    m_fontTex = CreateTexture((UINT)w, (UINT)h, DXGI_FORMAT_R8G8B8A8_UNORM);
+    const UINT64 rowPitch = ((UINT64)w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(UINT64)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    auto upload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, rowPitch * h, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!m_fontTex || !upload) return false;
+
+    uint8_t* mapped = nullptr;
+    upload->Map(0, nullptr, (void**)&mapped);
+    for (int y = 0; y < h; ++y) std::memcpy(mapped + rowPitch * y, pixels + (size_t)y * w * 4, (size_t)w * 4);
+    upload->Unmap(0, nullptr);
+
+    m_alloc->Reset();
+    m_cmd->Reset(m_alloc.Get(), nullptr);
+    Transition(m_fontTex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = m_fontTex.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)w, (UINT)h, 1, (UINT)rowPitch };
+    m_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(m_fontTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_cmd->Close();
+    ID3D12CommandList* lists[] = { m_cmd.Get() };
+    m_queue->ExecuteCommandLists(1, lists);
+    WaitForGpu();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_fontTex.Get(), &sv, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    io.Fonts->SetTexID((ImTextureID)m_srvHeap->GetGPUDescriptorHandleForHeapStart().ptr);
+    io.DisplaySize = ImVec2((float)m_width, (float)m_height);
+    io.BackendRendererName = "nexusbox_dx12";
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Renderer::DrawImGui(ImDrawData* dd)
+{
+#ifdef NEXUSBOX_HAS_IMGUI
+    if (!dd || dd->TotalVtxCount == 0 || !m_fontTex) return;
+
+    const UINT64 vbNeeded = (UINT64)dd->TotalVtxCount * sizeof(ImDrawVert);
+    const UINT64 ibNeeded = (UINT64)dd->TotalIdxCount * sizeof(ImDrawIdx);
+    if (vbNeeded > m_uiVBSize) { m_uiVBSize = vbNeeded + 64 * 1024; m_uiVB = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, m_uiVBSize, D3D12_RESOURCE_STATE_GENERIC_READ); }
+    if (ibNeeded > m_uiIBSize) { m_uiIBSize = ibNeeded + 32 * 1024; m_uiIB = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, m_uiIBSize, D3D12_RESOURCE_STATE_GENERIC_READ); }
+    if (!m_uiVB || !m_uiIB) return;
+
+    ImDrawVert* vtx = nullptr; ImDrawIdx* idx = nullptr;
+    D3D12_RANGE noRead{ 0, 0 };
+    m_uiVB->Map(0, &noRead, (void**)&vtx);
+    m_uiIB->Map(0, &noRead, (void**)&idx);
+    for (int n = 0; n < dd->CmdListsCount; ++n)
+    {
+        const ImDrawList* cl = dd->CmdLists[n];
+        std::memcpy(vtx, cl->VtxBuffer.Data, cl->VtxBuffer.Size * sizeof(ImDrawVert));
+        std::memcpy(idx, cl->IdxBuffer.Data, cl->IdxBuffer.Size * sizeof(ImDrawIdx));
+        vtx += cl->VtxBuffer.Size; idx += cl->IdxBuffer.Size;
+    }
+    m_uiVB->Unmap(0, nullptr);
+    m_uiIB->Unmap(0, nullptr);
+
+    // Orthographic projection (column-major for mul(proj, v) in HLSL).
+    const float L = dd->DisplayPos.x, R = dd->DisplayPos.x + dd->DisplaySize.x;
+    const float T = dd->DisplayPos.y, B = dd->DisplayPos.y + dd->DisplaySize.y;
+    float consts[17] = {
+        2.0f / (R - L), 0.0f, 0.0f, 0.0f,
+        0.0f, 2.0f / (T - B), 0.0f, 0.0f,
+        0.0f, 0.0f, 0.5f, 0.0f,
+        (R + L) / (L - R), (T + B) / (B - T), 0.5f, 1.0f,
+        0.0f };
+
+    D3D12_VIEWPORT vp{ 0, 0, (float)m_width, (float)m_height, 0.0f, 1.0f };
+    D3D12_VERTEX_BUFFER_VIEW vbv{ m_uiVB->GetGPUVirtualAddress(), (UINT)m_uiVBSize, sizeof(ImDrawVert) };
+    D3D12_INDEX_BUFFER_VIEW  ibv{ m_uiIB->GetGPUVirtualAddress(), (UINT)m_uiIBSize,
+                                  sizeof(ImDrawIdx) == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT };
+    m_cmd->SetPipelineState(m_uiPso.Get());
+    m_cmd->SetGraphicsRoot32BitConstants(0, 17, consts, 0);
+    m_cmd->RSSetViewports(1, &vp);
+    m_cmd->IASetVertexBuffers(0, 1, &vbv);
+    m_cmd->IASetIndexBuffer(&ibv);
+    m_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    int vtxOffset = 0, idxOffset = 0;
+    const ImVec2 clipOff = dd->DisplayPos;
+    for (int n = 0; n < dd->CmdListsCount; ++n)
+    {
+        const ImDrawList* cl = dd->CmdLists[n];
+        for (int c = 0; c < cl->CmdBuffer.Size; ++c)
+        {
+            const ImDrawCmd& cmd = cl->CmdBuffer[c];
+            if (cmd.UserCallback) { if (cmd.UserCallback != ImDrawCallback_ResetRenderState) cmd.UserCallback(cl, &cmd); continue; }
+            const LONG x0 = (LONG)std::max(0.0f, cmd.ClipRect.x - clipOff.x);
+            const LONG y0 = (LONG)std::max(0.0f, cmd.ClipRect.y - clipOff.y);
+            const LONG x1 = (LONG)std::min((float)m_width,  cmd.ClipRect.z - clipOff.x);
+            const LONG y1 = (LONG)std::min((float)m_height, cmd.ClipRect.w - clipOff.y);
+            if (x1 <= x0 || y1 <= y0) continue;
+            D3D12_RECT r{ x0, y0, x1, y1 };
+            m_cmd->RSSetScissorRects(1, &r);
+            D3D12_GPU_DESCRIPTOR_HANDLE tex{ (UINT64)cmd.GetTexID() };
+            m_cmd->SetGraphicsRootDescriptorTable(1, tex);
+            m_cmd->DrawIndexedInstanced(cmd.ElemCount, 1, cmd.IdxOffset + idxOffset, cmd.VtxOffset + vtxOffset, 0);
+        }
+        vtxOffset += cl->VtxBuffer.Size;
+        idxOffset += cl->IdxBuffer.Size;
+    }
+#else
+    (void)dd;
+#endif
+}
+
+// ------------------------------------------------------------------ frame
+
+void Renderer::Render(ImDrawData* ui)
+{
+    if (!m_ok) return;
+    const UINT bb = m_swapchain->GetCurrentBackBufferIndex();
+
+    m_alloc->Reset();
+    m_cmd->Reset(m_alloc.Get(), nullptr);
+
+    UploadVideoIfDirty();
+
+    Transition(m_backBuffers[bb].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += (SIZE_T)bb * m_rtvStride;
+    const float clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    m_cmd->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    m_cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
+    m_cmd->SetDescriptorHeaps(1, heaps);
     m_cmd->SetGraphicsRootSignature(m_rootSig.Get());
 
-    // CPU->GPU upload of the core frame (row-major pitch handling).
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-    UINT64 sz = 0;
-    D3D12_RESOURCE_DESC d = m_videoTex[slot]->GetDesc();
-    m_device->GetCopyableFootprints(&d, 0, 1, 0, &fp, nullptr, nullptr, &sz);
-    void* mapped = nullptr;
-    m_upload[slot]->Map(0, nullptr, &mapped);
-    const uint8_t* src = (const uint8_t*)frame.data;
-    for (uint32_t row = 0; row < frame.height; ++row)
-    {
-        memcpy((uint8_t*)mapped + fp.Footprint.RowPitch * row,
-               src + frame.pitch * row,
-               std::min<size_t>(frame.pitch, fp.Footprint.RowPitch));
-    }
-    m_upload[slot]->Unmap(0, nullptr);
+    DrawVideo();
+    DrawImGui(ui);
 
-    D3D12_TEXTURE_COPY_LOCATION dst{ m_videoTex[slot].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-    D3D12_TEXTURE_COPY_LOCATION srcL{ m_upload[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, fp };
-    m_cmd->CopyTextureRegion(&dst, 0, 0, 0, &srcL, nullptr);
-    // CD3DX12 helpers return temporaries; ResourceBarrier needs an l-value array.
-    D3D12_RESOURCE_BARRIER toSrv = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_videoTex[slot].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    m_cmd->ResourceBarrier(1, &toSrv);
-
-    // Compute the integer/bilinear dest rect honoring aspect + 4K output.
-    RECT dstRect{};
-    const UINT outW = 3840, outH = 2160;
-    if (m_scale == ScaleMode::Integer)
-    {
-        uint32_t mult = std::min(outW / frame.width, outH / frame.height);
-        mult = std::max(mult, 1u);
-        dstRect.left   = (outW - frame.width  * mult) / 2;
-        dstRect.top    = (outH - frame.height * mult) / 2;
-        dstRect.right  = dstRect.left + frame.width  * mult;
-        dstRect.bottom = dstRect.top  + frame.height * mult;
-    }
-    else
-    {
-        // Fit respecting aspect ratio, centered.
-        float scale = std::min((float)outW / frame.width, (float)outH / frame.height);
-        dstRect.left   = (LONG)((outW - frame.width * scale) / 2);
-        dstRect.top    = (LONG)((outH - frame.height * scale) / 2);
-        dstRect.right  = dstRect.left + (LONG)(frame.width * scale);
-        dstRect.bottom = dstRect.top  + (LONG)(frame.height * scale);
-    }
-    D3D12_VIEWPORT vp{ (float)dstRect.left, (float)dstRect.top,
-                       (float)(dstRect.right - dstRect.left),
-                       (float)(dstRect.bottom - dstRect.top) };
-    D3D12_RECT scissor = dstRect;
-    m_cmd->RSSetViewports(1, &vp);
-    m_cmd->RSSetScissorRects(1, &scissor);
-    m_cmd->OMSetRenderTargets(1, nullptr, FALSE, nullptr); // RTV heap in full build
-    m_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    m_cmd->DrawInstanced(4, 1, 0, 0);
-
-    // Signal the fence so Present knows the frame is ready (VRR pacing point).
+    Transition(m_backBuffers[bb].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     m_cmd->Close();
-    ID3D12CommandList* cl = m_cmd.Get();
-    m_queue->ExecuteCommandLists(1, &cl);
-    m_queue->Signal(m_fence.Get(), ++m_fenceValue);
-    (void)geo;
-}
+    ID3D12CommandList* lists[] = { m_cmd.Get() };
+    m_queue->ExecuteCommandLists(1, lists);
 
-void Renderer::Present()
-{
-    std::lock_guard lock(m_gpuMutex);
-    // Wait for the last Blit fence before presenting (frame-paced, not vsync-locked
-    // when VRR is active: tearing is allowed so present returns immediately).
-    UINT flags = m_vsync ? 0 : DXGI_PRESENT_ALLOW_TEARING;
-    m_swapchain->Present(m_vsync ? 1 : 0, flags);
-    m_backBuffer ^= 1;
-}
-
-void Renderer::OnResize(uint32_t /*w*/, uint32_t /*h*/)
-{
-    // Xbox presentation is fixed at the TV mode; no resize needed in Dev Mode.
-}
-
-void Renderer::HandleDeviceLost()
-{
-    // Rebuild device-dependent resources; cores are unaffected (CPU-side state).
-    CreateDeviceAndSwapchain();
-    CreateUploadRing();
-    CreateBlitPipeline();
-}
-
-void Renderer::SetScaleMode(ScaleMode m)         { m_scale = m; }
-void Renderer::SetVsync(bool on)                  { m_vsync = on; }
-void Renderer::SetLowLatencyMode(bool on)         { m_lowLatency = on; (void)on; }
-void Renderer::SetPostChain(const char* /*name*/)
-{
-    // Full build: load Slang/HLSL pass chain from disk, recompile PSO cache.
+    const UINT flags = (!m_vsync && m_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    const HRESULT hr = m_swapchain->Present(m_vsync ? 1 : 0, flags);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+    {
+        Debug("GPU device removed");
+        m_ok = false;
+        return;
+    }
+    WaitForGpu();
 }
 
 void Renderer::Shutdown()
 {
     WaitForGpu();
-    if (m_fenceEvent) CloseHandle(m_fenceEvent);
-}
-
-void Renderer::WaitForGpu()
-{
-    m_queue->Signal(m_fence.Get(), ++m_fenceValue);
-    if (m_fence->GetCompletedValue() < m_fenceValue)
-    {
-        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, INFINITE);
-    }
+    if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }
+    m_ok = false;
 }
 
 } // namespace nb

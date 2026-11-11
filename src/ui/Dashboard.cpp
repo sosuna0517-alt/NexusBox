@@ -1,341 +1,378 @@
-// Dashboard.cpp — the 10-foot shell.
+// Dashboard.cpp — library / settings / in-game menu.
+#include <windows.h>
 #include "Dashboard.h"
-#include "Scraper.h"
 #include "render/Renderer.h"
 #include "CoreEngine.h"
-#include "InputManager.h"
 #include "imgui.h"
-// Platform + DX12 glue comes from src/ui/ImguiBackend.* (UWP-safe; the
-// desktop imgui_impl_win32/dx12 backends do not compile under WindowsStore).
 
-#include <windows.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Storage.h>
 #include <algorithm>
-#include <cmath>
+#include <cwctype>
+#include <filesystem>
+#include <map>
 
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+namespace fs = std::filesystem;
 
 namespace nb
 {
 
-// Tuned for the 10-foot experience: big rows, generous padding, readable at 4K
-// from a couch. All coordinates are ImGui font-size-relative so they scale.
-static constexpr float kTileW    = 420.0f;   // logical px at 1080p design size
-static constexpr float kTileH    = 590.0f;   // 3:4-ish box art ratio
-static constexpr float kTileGap  = 36.0f;
-static constexpr float kRowScrollSpeed = 14.0f;
+static std::string U8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
 
-void Dashboard::Initialize(Renderer* renderer, CoreEngine* engine)
+// Extension -> (system, candidate cores). Only software-rendered cores work:
+// NexusBox does not provide OpenGL/Vulkan hardware rendering to cores.
+struct SystemInfo { const wchar_t* system; std::vector<std::wstring> cores; };
+static const std::map<std::wstring, SystemInfo>& SystemTable()
+{
+    static const std::map<std::wstring, SystemInfo> t = {
+        { L".nes", { L"NES",            { L"fceumm_libretro", L"nestopia_libretro", L"quicknes_libretro" } } },
+        { L".fds", { L"NES",            { L"fceumm_libretro", L"nestopia_libretro" } } },
+        { L".sfc", { L"SNES",           { L"snes9x_libretro", L"snes9x2010_libretro" } } },
+        { L".smc", { L"SNES",           { L"snes9x_libretro", L"snes9x2010_libretro" } } },
+        { L".gb",  { L"Game Boy",       { L"gambatte_libretro", L"mgba_libretro" } } },
+        { L".gbc", { L"Game Boy Color", { L"gambatte_libretro", L"mgba_libretro" } } },
+        { L".gba", { L"Game Boy Advance", { L"mgba_libretro", L"vba_next_libretro" } } },
+        { L".md",  { L"Genesis",        { L"genesis_plus_gx_libretro", L"picodrive_libretro" } } },
+        { L".gen", { L"Genesis",        { L"genesis_plus_gx_libretro", L"picodrive_libretro" } } },
+        { L".smd", { L"Genesis",        { L"genesis_plus_gx_libretro", L"picodrive_libretro" } } },
+        { L".sms", { L"Master System",  { L"genesis_plus_gx_libretro", L"picodrive_libretro" } } },
+        { L".gg",  { L"Game Gear",      { L"genesis_plus_gx_libretro" } } },
+        { L".pce", { L"PC Engine",      { L"mednafen_pce_fast_libretro" } } },
+        { L".ngp", { L"Neo Geo Pocket", { L"mednafen_ngp_libretro" } } },
+        { L".ngc", { L"Neo Geo Pocket Color", { L"mednafen_ngp_libretro" } } },
+        { L".ws",  { L"WonderSwan",     { L"mednafen_wswan_libretro" } } },
+        { L".wsc", { L"WonderSwan Color", { L"mednafen_wswan_libretro" } } },
+        { L".a26", { L"Atari 2600",     { L"stella2014_libretro", L"stella_libretro" } } },
+        { L".cue", { L"PlayStation",    { L"pcsx_rearmed_libretro", L"swanstation_libretro" } } },
+        { L".chd", { L"PlayStation",    { L"pcsx_rearmed_libretro", L"swanstation_libretro" } } },
+        { L".pbp", { L"PlayStation",    { L"pcsx_rearmed_libretro" } } },
+        { L".zip", { L"Arcade",         { L"fbneo_libretro", L"mame2003_plus_libretro" } } },
+    };
+    return t;
+}
+
+bool Dashboard::Initialize(Renderer* renderer, CoreEngine* engine)
 {
     m_renderer = renderer;
     m_engine   = engine;
-    m_scraper  = std::make_unique<Scraper>();
+    m_coresDir = std::wstring(winrt::Windows::ApplicationModel::Package::Current().InstalledLocation().Path().c_str()) + L"\\cores";
 
+    IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;   // 10-foot: gamepad-first
-    io.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleFonts;
-    io.IniFilename = nullptr;                              // no config in sandbox
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    io.BackendPlatformName = "nexusbox_xbox";
 
-    // 10-foot legibility: 28pt base (≈ 2x desktop default). Freetype rasterizer
-    // recommended; bitmap fonts look soft at 4K.
-    io.FontGlobalScale = 1.0f;
+    // 10-foot UI: large font and widgets (the TV is several feet away).
     ImFontConfig cfg;
-    cfg.SizePixels = 28.0f;
-    // io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 28.0f, &cfg);
+    cfg.SizePixels = 30.0f;
+    io.Fonts->AddFontDefault(&cfg);
 
-    m_renderer->InitImGuiBackend();   // Win32 handler + D3D12 device/queue binding
+    ImGui::StyleColorsDark();
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.ScaleAllSizes(2.0f);
+    st.WindowRounding = 12.0f;
+    st.FrameRounding = 8.0f;
+    st.Colors[ImGuiCol_WindowBg]      = ImVec4(0.04f, 0.05f, 0.08f, 1.00f);
+    st.Colors[ImGuiCol_Header]        = ImVec4(0.10f, 0.45f, 0.20f, 0.60f);
+    st.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.12f, 0.60f, 0.25f, 0.85f);
+    st.Colors[ImGuiCol_HeaderActive]  = ImVec4(0.14f, 0.70f, 0.30f, 1.00f);
+    st.Colors[ImGuiCol_Button]        = ImVec4(0.12f, 0.16f, 0.22f, 1.00f);
+    st.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.12f, 0.60f, 0.25f, 0.85f);
+    st.Colors[ImGuiCol_ButtonActive]  = ImVec4(0.14f, 0.70f, 0.30f, 1.00f);
+    st.Colors[ImGuiCol_NavCursor]  = ImVec4(0.40f, 1.00f, 0.50f, 1.00f);
 
-    // Load library from all mounted sources.
-    auto games = StorageManager::ScanLibrary();
-    for (auto& g : games)
-    {
-        LibraryEntry e;
-        e.game = g;
-        e.displayName = g.name;
-        e.system = m_scraper->DetectSystem(g.path);
-        e.coreId = m_scraper->PickCore(e.system);
-        m_library.push_back(std::move(e));
-    }
-    // Scrape metadata asynchronously (box art, descriptions) after first frame.
-    m_scraper->ScrapeLibraryAsync(m_library);
-
-    // System tabs: All + distinct systems with entries.
-    m_systemTabs.push_back(L"All");
-    for (auto& e : m_library)
-        if (std::find(m_systemTabs.begin(), m_systemTabs.end(), e.system) == m_systemTabs.end())
-            m_systemTabs.push_back(e.system);
-
-    m_screen = Screen::Boot;
+    if (!m_renderer->InitImGui()) return false;
+    ScanLibrary();
+    return true;
 }
 
 void Dashboard::Shutdown()
 {
-    if (m_scraper) m_scraper->Shutdown();
-    ImGui_ImplDX12_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
+    if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
 }
 
-// ------------------------------------------------------------------ navigation
-
-void Dashboard::NavigateGrid(int dx, int dy)
-{
-    // Grid is refiltered per tab; wrap at edges, clamp vertically.
-    m_focusX = std::max(0, m_focusX + dx);
-    m_focusY = std::max(0, m_focusY + dy);
-    m_focusAnimX += (float)dx;   // eased toward 0 by Update
-    m_focusAnimY += (float)dy;
-}
-
-void Dashboard::Update(float dt, const std::vector<PadState>& pads)
+void Dashboard::FeedGamepad(const PadState& p)
 {
     ImGuiIO& io = ImGui::GetIO();
-    io.DeltaTime = dt;
+    auto b = [&](PadButton x) { return (p.buttons & (1u << (int)x)) != 0; };
+    io.AddKeyEvent(ImGuiKey_GamepadFaceDown,  b(PadButton::A));
+    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, b(PadButton::B));
+    io.AddKeyEvent(ImGuiKey_GamepadFaceLeft,  b(PadButton::X));
+    io.AddKeyEvent(ImGuiKey_GamepadFaceUp,    b(PadButton::Y));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    b(PadButton::DPadUp));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  b(PadButton::DPadDown));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft,  b(PadButton::DPadLeft));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, b(PadButton::DPadRight));
+    io.AddKeyEvent(ImGuiKey_GamepadL1,        b(PadButton::LB));
+    io.AddKeyEvent(ImGuiKey_GamepadR1,        b(PadButton::RB));
+    io.AddKeyEvent(ImGuiKey_GamepadStart,     b(PadButton::Menu));
+    io.AddKeyEvent(ImGuiKey_GamepadBack,      b(PadButton::View));
+    auto stick = [&](ImGuiKey key, float v) { io.AddKeyAnalogEvent(key, v > 0.3f, std::clamp(v, 0.0f, 1.0f)); };
+    stick(ImGuiKey_GamepadLStickUp,    p.ly);
+    stick(ImGuiKey_GamepadLStickDown, -p.ly);
+    stick(ImGuiKey_GamepadLStickLeft, -p.lx);
+    stick(ImGuiKey_GamepadLStickRight, p.lx);
+}
 
-    // Gamepad -> ImGui nav (the backend also handles core input when running).
-    if (!pads.empty())
-    {
-        const auto& p = pads[0];
-        auto b = [&](PadButton n) { return (p.buttons & (1u << (int)n)) != 0; };
-        io.NavInputs[ImGuiNavInput_Activate]  = b(PadButton::A)     ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_Cancel]    = b(PadButton::B)     ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_Input]     = b(PadButton::Menu)  ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_DpadLeft]  = b(PadButton::DPadLeft)  ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_DpadRight] = b(PadButton::DPadRight) ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_DpadUp]    = b(PadButton::DPadUp)    ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_DpadDown]  = b(PadButton::DPadDown)  ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_FocusPrev] = b(PadButton::LB) ? 1.0f : 0.0f;
-        io.NavInputs[ImGuiNavInput_FocusNext] = b(PadButton::RB) ? 1.0f : 0.0f;
-    }
+ImDrawData* Dashboard::Update(float dt, const PadState& pad)
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.DeltaTime = std::max(dt, 1.0f / 1000.0f);
+    io.DisplaySize = ImVec2((float)m_renderer->Width(), (float)m_renderer->Height());
 
-    // Ease focus (spring-ish) for the cover flow feel.
-    const float ease = 1.0f - std::pow(0.001f, dt);
-    m_focusAnimX *= (1.0f - ease);
-    m_focusAnimY *= (1.0f - ease);
+    // While a game is running the UI is hidden and must not eat the inputs.
+    if (m_screen != Screen::Hidden) FeedGamepad(pad);
+    else                            FeedGamepad(PadState{});
+
+    // Menu button on the Library opens Settings; B backs out of sub-screens.
+    const uint16_t pressed = pad.buttons & ~m_prevButtons;
+    m_prevButtons = pad.buttons;
+    auto hit = [&](PadButton x) { return (pressed & (1u << (int)x)) != 0; };
+    if (m_screen == Screen::Library && hit(PadButton::Menu)) { m_screen = Screen::Settings; m_focusFirst = true; }
+    else if (m_screen == Screen::Settings && (hit(PadButton::B) || hit(PadButton::Menu))) { m_screen = Screen::Library; m_focusFirst = true; }
+    else if (m_screen == Screen::InGameMenu && hit(PadButton::B)) { m_engine->Resume(); m_screen = Screen::Hidden; }
 
     ImGui::NewFrame();
-
     switch (m_screen)
     {
-    case Screen::Boot:        DrawBootSplash(dt); break;
-    case Screen::Library:     DrawLibrary(dt);    break;
-    case Screen::GameDetail:  DrawGameDetail();   break;
-    case Screen::Settings:    DrawSettings();     break;
-    case Screen::Overlay:     DrawOverlay();      break;
-    default: break;
+    case Screen::Library:    DrawLibrary();    break;
+    case Screen::Settings:   DrawSettings();   break;
+    case Screen::InGameMenu: DrawInGameMenu(); break;
+    case Screen::Hidden:     break;
     }
-
+    DrawToast(dt);
     ImGui::Render();
-    m_renderer->RenderImGui(ImGui::GetDrawData());   // into the same command queue
+    return ImGui::GetDrawData();
 }
 
-// ------------------------------------------------------------------ screens
-
-void Dashboard::DrawBootSplash(float dt)
+void Dashboard::OpenInGameMenu()
 {
-    m_bootTimer += dt;
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.09f, 1.0f));
-    ImGui::Begin("##boot", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav);
-    const float a = std::clamp(m_bootTimer / 1.2f, 0.0f, 1.0f);
-    ImGui::SetCursorPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f - 220, 400));
-    ImGui::TextColored(ImVec4(0.5f, 0.85f, 1.0f, a), "NEXUSBOX");
-    ImGui::SetCursorPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f - 220, 470));
-    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.75f, a), "Press  A  to  continue");
-    if (m_bootTimer > 1.2f && ImGui::IsNavInputTest(ImGuiNavInput_Activate, ImGuiNavReadMode_Pressed))
-    {
-        m_screen = Screen::Library;
-        m_bootTimer = 0;
-    }
-    ImGui::End();
-    ImGui::PopStyleColor();
+    m_engine->Pause();
+    m_screen = Screen::InGameMenu;
+    m_focusFirst = true;
 }
 
-void Dashboard::DrawLibrary(float dt)
+void Dashboard::Toast(const std::wstring& msg, float seconds)
+{
+    m_toast = U8(msg);
+    m_toastTime = seconds;
+    OutputDebugStringW((L"[NexusBox] " + msg + L"\n").c_str());
+}
+
+void Dashboard::DrawToast(float dt)
+{
+    if (m_toastTime <= 0.0f) return;
+    m_toastTime -= dt;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 60.0f), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    ImGui::Begin("##toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs);
+    ImGui::PushTextWrapPos(io.DisplaySize.x * 0.7f);
+    ImGui::TextUnformatted(m_toast.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::End();
+}
+
+// ------------------------------------------------------------------ library
+
+bool Dashboard::CoreInstalled(const std::wstring& dll) const
+{
+    std::error_code ec;
+    return fs::exists(m_coresDir + L"\\" + dll + L".dll", ec);
+}
+
+void Dashboard::ScanLibrary()
+{
+    m_games.clear();
+    m_scannedDirs.clear();
+    std::vector<std::wstring> roots = { m_engine->RomsDir() };
+    for (wchar_t d : { L'D', L'E', L'F', L'G' })
+        roots.push_back(std::wstring(1, d) + L":\\roms");
+
+    const auto& table = SystemTable();
+    for (const auto& root : roots)
+    {
+        std::error_code ec;
+        if (!fs::is_directory(root, ec)) continue;
+        m_scannedDirs.push_back(root);
+        for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+        {
+            if (it.depth() > 2) { it.disable_recursion_pending(); continue; }
+            if (!it->is_regular_file(ec)) continue;
+            std::wstring ext = it->path().extension().wstring();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+            auto t = table.find(ext);
+            if (t == table.end()) continue;
+            m_games.push_back({ it->path().wstring(), it->path().stem().wstring(), t->second.system, t->second.cores });
+        }
+    }
+    std::sort(m_games.begin(), m_games.end(), [](const GameEntry& a, const GameEntry& b)
+    { return a.system != b.system ? a.system < b.system : _wcsicmp(a.title.c_str(), b.title.c_str()) < 0; });
+}
+
+static void BeginFullscreen(const char* id)
 {
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(io.DisplaySize);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.07f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(64, 40));
-    ImGui::Begin("##library", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoScrollbar);
-
-    // ---- System tabs
-    for (int i = 0; i < (int)m_systemTabs.size(); ++i)
-    {
-        ImGui::SameLine(i == 0 ? 64 : 0);
-        ImGui::PushID(i);
-        if (ImGui::Selectable(WideToUtf8(m_systemTabs[i]).c_str(), m_activeTab == i,
-                              ImGuiSelectableFlags_SelectOnNav))
-            m_activeTab = i;
-        ImGui::PopID();
-    }
-
-    // ---- Cover grid
-    ImGui::NewLine();
-    const float tileStep = kTileW + kTileGap;
-    int col = 0, row = 0;
-    for (int gi = 0; gi < (int)m_library.size(); ++gi)
-    {
-        const auto& e = m_library[gi];
-        if (m_activeTab > 0 && e.system != m_systemTabs[m_activeTab]) continue;
-
-        const bool focused = (gi == m_focusX);
-        ImGui::SameLine(64.0f + col * tileStep, 0);
-        ImGui::PushID(gi);
-        ImVec2 size(kTileW, kTileH);
-        if (focused)
-        {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() - 8);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 8);
-            size.x += 16; size.y += 16;
-        }
-        // Box art (Scraper caches to <saves>\media); placeholder tint until scraped.
-        if (e.boxartUv.empty())
-            ImGui::Dummy(size);
-        else
-            ImGui::Image(m_renderer->TextureId(e.boxartUv), size);
-        if (ImGui::IsItemHovered() || focused)
-        {
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 34);
-            ImGui::TextUnformatted(WideToUtf8(e.displayName).c_str());
-        }
-        if ((focused && ImGui::IsNavInputTest(ImGuiNavInput_Activate, ImGuiNavReadMode_Pressed))
-            || ImGui::IsItemClicked())
-            Launch(e);
-        ImGui::PopID();
-        ++col;
-        if (col >= (int)(io.DisplaySize.x - 128) / (int)tileStep) { col = 0; ++row; }
-    }
-
-    // ---- Bottom hints (10-foot convention)
-    ImGui::SetCursorPos(ImVec2(64, io.DisplaySize.y - 80));
-    ImGui::TextDisabled("A: Launch    B: Back    Menu: Settings    RB/LB: Systems");
-
-    ImGui::End();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
+    // Keep 5% inside the TV-safe area.
+    const float mx = io.DisplaySize.x * 0.05f, my = io.DisplaySize.y * 0.05f;
+    ImGui::SetNextWindowPos(ImVec2(mx, my));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x - 2 * mx, io.DisplaySize.y - 2 * my));
+    ImGui::Begin(id, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
 }
 
-void Dashboard::DrawGameDetail()
+void Dashboard::DrawLibrary()
 {
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-    ImGui::Begin("##detail", nullptr, ImGuiWindowFlags_NoDecoration);
-    ImGui::TextUnformatted(WideToUtf8(m_library[m_focusX].displayName).c_str());
-    ImGui::TextDisabled("%S", m_library[m_focusX].system.c_str());
-    ImGui::Separator();
-    if (ImGui::Button("Play"))
-    {
-        Launch(m_library[m_focusX]);
-        m_screen = Screen::Library;
-    }
+    BeginFullscreen("##library");
+    ImGui::TextColored(ImVec4(0.40f, 1.0f, 0.50f, 1.0f), "NEXUSBOX");
     ImGui::SameLine();
-    if (ImGui::Button("Back"))
-        m_screen = Screen::Library;
+    ImGui::TextDisabled("  %d games", (int)m_games.size());
+    ImGui::Separator();
+
+    const float footer = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+    ImGui::BeginChild("##list", ImVec2(0, -footer), ImGuiChildFlags_NavFlattened);
+    if (m_games.empty())
+    {
+        ImGui::TextWrapped("No games found. Copy ROMs into one of these folders, then choose Rescan:");
+        ImGui::BulletText("%s", U8(m_engine->RomsDir()).c_str());
+        ImGui::BulletText("E:\\roms (USB drive)");
+        ImGui::Spacing();
+        ImGui::TextWrapped("Tip: in Xbox Device Portal, open File explorer > LocalAppData > NexusBox > LocalState > roms.");
+        ImGui::Spacing();
+        if (m_focusFirst) { ImGui::SetKeyboardFocusHere(); m_focusFirst = false; }
+        if (ImGui::Button("Rescan")) ScanLibrary();
+    }
+    else
+    {
+        std::wstring lastSystem;
+        for (size_t i = 0; i < m_games.size(); ++i)
+        {
+            const auto& g = m_games[i];
+            if (g.system != lastSystem)
+            {
+                ImGui::Spacing();
+                ImGui::TextDisabled("%s", U8(g.system).c_str());
+                lastSystem = g.system;
+            }
+            ImGui::PushID((int)i);
+            if (m_focusFirst && i == 0) { ImGui::SetKeyboardFocusHere(); m_focusFirst = false; }
+            if (ImGui::Selectable(U8(g.title).c_str(), false, ImGuiSelectableFlags_None, ImVec2(0, 48)))
+                Launch(g);
+            ImGui::PopID();
+        }
+        ImGui::Spacing();
+        if (ImGui::Button("Rescan")) ScanLibrary();
+    }
+    ImGui::EndChild();
+    ImGui::Separator();
+    ImGui::TextDisabled("A: Play     Menu: Settings     In game: View + Menu opens the menu");
     ImGui::End();
 }
+
+void Dashboard::Launch(const GameEntry& g)
+{
+    std::wstring chosen;
+    for (const auto& c : g.cores) if (CoreInstalled(c)) { chosen = c; break; }
+    if (chosen.empty())
+    {
+        std::wstring names;
+        for (const auto& c : g.cores) names += (names.empty() ? L"" : L" or ") + c + L".dll";
+        Toast(L"No core installed for " + g.system + L". Add " + names + L" to the cores folder and redeploy.", 8.0f);
+        return;
+    }
+    std::wstring error;
+    if (!m_engine->LoadGame(L"cores\\" + chosen + L".dll", g.path, error))
+    {
+        Toast(error, 8.0f);
+        return;
+    }
+    m_screen = Screen::Hidden;
+    Toast(L"Playing " + g.title + L"  -  press View + Menu for the menu", 4.0f);
+}
+
+// ------------------------------------------------------------------ settings
 
 void Dashboard::DrawSettings()
 {
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-    ImGui::Begin("##settings", nullptr, ImGuiWindowFlags_NoDecoration);
-    ImGui::TextUnformatted("Settings");
+    BeginFullscreen("##settings");
+    ImGui::TextColored(ImVec4(0.40f, 1.0f, 0.50f, 1.0f), "SETTINGS");
     ImGui::Separator();
 
-    static int scaleMode = 2;   // Integer default
-    ImGui::RadioButton("Nearest",   &scaleMode, 0); ImGui::SameLine();
-    ImGui::RadioButton("Bilinear",  &scaleMode, 1); ImGui::SameLine();
-    ImGui::RadioButton("Integer",   &scaleMode, 2);
-    m_renderer->SetScaleMode((ScaleMode)scaleMode);
-
-    static bool vsync = true, lowLatency = true;
-    ImGui::Checkbox("VSync (off = VRR/tearing allowed)", &vsync);
-    m_renderer->SetVsync(vsync);
-    ImGui::Checkbox("Low Latency Mode", &lowLatency);
-    m_renderer->SetLowLatencyMode(lowLatency);
-
-    static int shaderIdx = 0;
-    const char* shaders[] = { "None", "Scanlines", "CRT-Royale" };
-    if (ImGui::Combo("Post-processing shader", &shaderIdx, shaders, 3))
-        m_renderer->SetPostChain(shaderIdx == 1 ? "scanlines" :
-                                 shaderIdx == 2 ? "crt-royale" : nullptr);
-
-    static bool rewind = false;
-    ImGui::Checkbox("Rewind (64MB ring)", &rewind);
-    m_engine->SetRewindEnabled(rewind);
-
-    static float autoSaveSec = 30.0f;
-    if (ImGui::SliderFloat("Auto-save interval (s)", &autoSaveSec, 5.0f, 120.0f, "%.0f"))
-        m_engine->States().SetAutoSaveIntervalSec(autoSaveSec);
-
+    int scale = (int)m_renderer->GetScaleMode();
+    if (m_focusFirst) { ImGui::SetKeyboardFocusHere(); m_focusFirst = false; }
+    if (ImGui::RadioButton("Integer scaling (sharpest)", scale == 2)) m_renderer->SetScaleMode(ScaleMode::Integer);
+    if (ImGui::RadioButton("Fit screen, sharp pixels", scale == 0))   m_renderer->SetScaleMode(ScaleMode::Nearest);
+    if (ImGui::RadioButton("Fit screen, smooth", scale == 1))         m_renderer->SetScaleMode(ScaleMode::Bilinear);
+    ImGui::Spacing();
+    bool vsync = m_renderer->GetVsync();
+    if (ImGui::Checkbox("VSync", &vsync)) m_renderer->SetVsync(vsync);
+    ImGui::Spacing();
     ImGui::Separator();
-    if (ImGui::Button("Back"))
-        m_screen = Screen::Library;
+    ImGui::TextDisabled("Cores folder: %s", U8(m_coresDir).c_str());
+    ImGui::TextDisabled("BIOS folder:  %s", U8(m_engine->SystemDir()).c_str());
+    ImGui::TextDisabled("Saves folder: %s", U8(m_engine->SavesDir()).c_str());
+    ImGui::Spacing();
+    if (ImGui::Button("Back")) { m_screen = Screen::Library; m_focusFirst = true; }
     ImGui::End();
 }
 
-void Dashboard::DrawOverlay()
+// ------------------------------------------------------------------ in-game
+
+void Dashboard::DrawInGameMenu()
 {
-    // Quick-access HUD: floats over the running game, drawn into the same
-    // frame's command list before present.
-    const float w = 560.0f, h = 640.0f;
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - w - 48, 48), ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Appearing);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.08f, 0.92f));
-    ImGui::Begin("NexusBox Overlay", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
-
-    ImGui::TextUnformatted("Quick Access");
+    const ImVec2 size(760, 0);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(size);
+    ImGui::SetNextWindowBgAlpha(0.94f);
+    ImGui::Begin("##ingame", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+    ImGui::TextColored(ImVec4(0.40f, 1.0f, 0.50f, 1.0f), "%s", U8(m_engine->GameTitle()).c_str());
+    ImGui::TextDisabled("%s   %.0f fps", m_engine->CoreName().c_str(), m_engine->Profile().AvgFps());
     ImGui::Separator();
 
-    if (ImGui::Button("Save State (Slot 1)")) m_engine->SaveStateNow(1);
+    const ImVec2 bw(-FLT_MIN, 0);
+    if (m_focusFirst) { ImGui::SetKeyboardFocusHere(); m_focusFirst = false; }
+    if (ImGui::Button("Resume", bw)) { m_engine->Resume(); m_screen = Screen::Hidden; }
+
+    ImGui::Text("State slot: %d", m_stateSlot);
     ImGui::SameLine();
-    if (ImGui::Button("Load State (Slot 1)")) m_engine->LoadStateNow(1);
-
-    if (ImGui::Button("Rewind")) m_engine->SetRewindEnabled(true);
+    if (ImGui::SmallButton(" - ")) m_stateSlot = std::max(1, m_stateSlot - 1);
     ImGui::SameLine();
-    if (ImGui::Button("Stop Rewind")) m_engine->SetRewindEnabled(false);
+    if (ImGui::SmallButton(" + ")) m_stateSlot = std::min(9, m_stateSlot + 1);
 
-    static float ff = 1.0f;
-    if (ImGui::SliderFloat("Fast forward", &ff, 1.0f, 8.0f, "x%.1f"))
-        m_engine->SetFastForward(ff);
-
-    // Real-time profiler readout (from CoreEngine).
-    auto& prof = m_engine->Profile();
-    ImGui::Text("Frametime: %.2f ms  (%.0f fps)", prof.LastFrameMs(), prof.AvgFps());
-    ImGui::Text("Memory:    %.0f MB", Profiler::MemMB());
-    ImGui::Text("Latency:   input->present budget %.2f ms", 1000.0f / prof.AvgFps());
-
-    ImGui::Separator();
-    if (ImGui::Button("Resume"))
+    std::wstring msg;
+    if (ImGui::Button("Save state", bw)) { m_engine->SaveState(m_stateSlot, msg); Toast(msg, 3.0f); }
+    if (ImGui::Button("Load state", bw))
     {
-        m_engine->Resume();
-        m_overlayOpen = false;
+        if (m_engine->LoadState(m_stateSlot, msg)) { m_engine->Resume(); m_screen = Screen::Hidden; }
+        Toast(msg, 3.0f);
     }
+    bool ff = m_engine->FastForward();
+    if (ImGui::Checkbox("Fast forward (4x)", &ff)) m_engine->SetFastForward(ff);
+    if (ImGui::Button("Reset game", bw)) { m_engine->ResetGame(); m_engine->Resume(); m_screen = Screen::Hidden; }
+    if (ImGui::Button("Quit to library", bw))
+    {
+        m_engine->UnloadGame();
+        m_screen = Screen::Library;
+        m_focusFirst = true;
+    }
+    ImGui::Spacing();
+    ImGui::TextDisabled("B: Resume");
     ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
-}
-
-void Dashboard::ShowLibrary()  { m_screen = Screen::Library; m_overlayOpen = false; }
-void Dashboard::ShowOverlay()  { m_screen = Screen::Overlay; m_overlayOpen = true;  }
-void Dashboard::HideOverlay()  { if (m_overlayOpen) { m_screen = Screen::Library; m_overlayOpen = false; } }
-
-void Dashboard::Launch(const LibraryEntry& e)
-{
-    // Resolve the core DLL and launch. Failure surfaces a toast in the overlay.
-    std::wstring corePath = StorageManager::CoresDir() + L"\\" + e.coreId + L".dll";
-    if (!m_engine->LoadCore(corePath.c_str(), e.game.path.c_str()))
-    {
-        // TODO: toast notification ("core not found").
-        return;
-    }
-    m_screen = Screen::Overlay;   // HUD active over the running game
-    m_overlayOpen = true;
 }
 
 } // namespace nb

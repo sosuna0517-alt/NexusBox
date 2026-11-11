@@ -1,80 +1,83 @@
 #pragma once
-// CoreEngine.h — the deterministic emulation dispatch loop.
-// Owns frame pacing (60/120Hz ticks), binds: InputManager -> retro_run ->
-// Renderer blit -> AudioEngine ring buffer. All cross-thread data flows through
-// lock-free SPSC queues or seqlock snapshots; the emulation thread never blocks
-// on GPU/audio.
+// CoreEngine.h — owns the loaded libretro core and runs it on a dedicated
+// emulation thread paced to the core's native frame rate. The UI thread only
+// calls the public methods below; m_coreMutex serializes core access.
 #include <cstdint>
 #include <memory>
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <thread>
-#include <chrono>
 
 #include "core/RetroCoreLoader.h"
-#include "save/SaveStateManager.h"
 #include "util/Profiler.h"
 
 namespace nb {
-class Renderer; class InputManager; class AudioEngine; class Netplay;
+class Renderer; class InputManager; class AudioEngine;
 
-enum class Mode { Dashboard, Running, Paused, Overlay };
-
-struct FrameContext
-{
-    uint64_t  frameIndex = 0;
-    double    targetFps  = 60.0;        // from retro_get_system_av_info
-    double    audioSampleRate = 48000.0;
-    bool      skipVideo  = false;       // fast-forward frames skip blit
-    bool      rewindTick = false;       // rewind buffer captured this frame
-};
+enum class Mode { Dashboard, Running, Paused };
 
 class CoreEngine
 {
 public:
-    void   Initialize(Renderer* renderer);
-    void   Start();
-    void   Shutdown();
+    CoreEngine();
+    ~CoreEngine();
 
-    bool   LoadCore(const wchar_t* corePath, const wchar_t* romPath);
-    void   UnloadCore();
+    void Initialize(Renderer* renderer, InputManager* input);
+    void Start();
+    void Shutdown();
 
-    void   Tick();                       // called from the UI thread each Run() pass
-    void   Pause();  void  Resume(bool newResume = false);
+    // corePath is package-relative (cores\\name_libretro.dll).
+    bool LoadGame(const std::wstring& corePath, const std::wstring& romPath, std::wstring& error);
+    void UnloadGame();
 
-    // App lifecycle hooks (called from App on Suspending/Resuming).
-    void   PrepareForSuspension();
-    void   OnResume();
-    void   SetFastForward(float speed);  // 1.0 = realtime
-    void   SetRewindEnabled(bool on);
-    bool   SaveStateNow(int slot);       // synchronous (user-invoked)
-    bool   LoadStateNow(int slot);
-    bool   HandleSystemBack();           // returns true if B was consumed by UI
+    void Pause();
+    void Resume();
+    void ResetGame();
+    Mode GetMode() const { return m_mode.load(); }
+    bool HasGame() const { return m_hasGame.load(); }
 
-    SaveStateManager& States()  { return m_states; }
-    Profiler&         Profile() { return m_profiler; }
-    Mode              GetMode() const { return m_mode; }
-    ~CoreEngine();    // defined in CoreEngine.cpp (Netplay is complete there)
+    bool SaveState(int slot, std::wstring& message);
+    bool LoadState(int slot, std::wstring& message);
+    void SetFastForward(bool on) { m_fastForward = on; }
+    bool FastForward() const     { return m_fastForward; }
+
+    // Lifecycle (App Suspending / Resuming).
+    void PrepareForSuspension();
+    void OnResume();
+
+    std::string CoreName() const { return m_coreName; }
+    std::wstring GameTitle() const { return m_gameTitle; }
+    Profiler& Profile() { return m_profiler; }
+
+    // Directories (LocalState sub-folders).
+    std::wstring SystemDir() const { return m_localDir + L"\\system"; }
+    std::wstring SavesDir()  const { return m_localDir + L"\\saves"; }
+    std::wstring RomsDir()   const { return m_localDir + L"\\roms"; }
+    std::wstring LocalDir()  const { return m_localDir; }
 
 private:
-    void   EmulationLoop();              // runs on its own high-priority thread
-    void   SyncPacing(double targetFps);
+    void EmulationLoop();
+    void LoadSram();
+    void SaveSram();
+    std::wstring StatePath(int slot) const;
+    std::wstring SramPath() const;
 
-    Renderer*           m_renderer = nullptr;
-    std::unique_ptr<InputManager> m_input;
+    Renderer*                     m_renderer = nullptr;
+    InputManager*                 m_input = nullptr;
     std::unique_ptr<AudioEngine>  m_audio;
-    std::unique_ptr<Netplay>      m_netplay;
+    RetroCoreLoader               m_core;
+    Profiler                      m_profiler;
+    std::mutex                    m_coreMutex;
 
-    RetroCoreLoader     m_core;
-    SaveStateManager    m_states;
-    Profiler            m_profiler;
+    std::atomic<Mode>             m_mode{ Mode::Dashboard };
+    std::atomic<bool>             m_hasGame{ false };
+    std::atomic<bool>             m_runThread{ false };
+    std::atomic<bool>             m_fastForward{ false };
+    std::thread                   m_thread;
 
-    Mode                m_mode = Mode::Dashboard;
-    std::atomic<bool>   m_runThread{ false };
-    std::atomic<float>  m_speed{ 1.0f };
-    std::atomic<bool>   m_rewind{ false };
-    std::thread         m_thread;
-
-    double              m_nextTickMs = 0.0;   // drift-free pacing accumulator
+    std::wstring                  m_localDir, m_romPath, m_gameTitle;
+    std::string                   m_coreName;
 };
 
 } // namespace nb

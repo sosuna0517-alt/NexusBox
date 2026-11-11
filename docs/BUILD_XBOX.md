@@ -29,3 +29,21 @@ cmake --preset win-x64-vs2022
 - `broadFileSystemAccess` — external ROM/core drives (D:).
 - `extendedExecutionUnconstrained` — keep autosave/SRAM flush running.
 - `removableStorage` + `DeviceCapability` mass-storage — USB auto-mount.
+
+## Quick start (dashboard build)
+
+1. Put UWP x64 libretro cores in `cores/` (see `cores/README.md`), e.g.
+   `snes9x_libretro.dll`, `fceumm_libretro.dll`, `mgba_libretro.dll`,
+   `gambatte_libretro.dll`, `genesis_plus_gx_libretro.dll`.
+2. `cmake --preset win-x64` then open `build/win-x64/NexusBox.sln`, choose
+   **x64 / Remote Machine**, enter the console IP, and deploy.
+   (Re-run CMake whenever you add or remove a core so it is packaged.)
+3. Copy ROMs to the app's `LocalState\roms` folder with Xbox Device Portal
+   (File explorer > LocalAppData > NexusBox_... > LocalState > roms), or to
+   `E:\roms` on a USB drive. BIOS files go in `LocalState\system`.
+4. Launch NexusBox: pick a game with the D-pad and press A.
+   In game, press **View + Menu** (or L3 + R3) for the in-game menu
+   (save/load state, fast forward, reset, quit). Menu on the library opens Settings.
+
+Controller mapping is positional (SNES layout): Xbox A = libretro B,
+B = A, X = Y, Y = X, View = Select, Menu = Start, LB/RB = L/R, LT/RT = L2/R2.

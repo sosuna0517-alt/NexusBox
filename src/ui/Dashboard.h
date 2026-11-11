@@ -1,80 +1,62 @@
 #pragma once
-// Dashboard.h — console-grade 10-foot UI shell.
-// - Grid cover flow with focus easing ( Xbox dashboard-like navigation).
-// - Systems tab bar, Recently Played row, Settings entry.
-// - Drives the Scraper to fill box art / metadata into the library cache.
-// - Same D3D12 command queue as the game blit; drawn between blit and present
-//   (no second swapchain), so switching Dashboard <-> Running is seamless.
+// Dashboard.h — 10-foot ImGui shell: game library, settings, in-game menu.
+// Gamepad-only navigation (ImGui gamepad nav). Draw data is rendered by the
+// Renderer in the same frame as the game video.
 #include <string>
 #include <vector>
-#include <memory>
 #include <cstdint>
 
-#include "storage/StorageManager.h"
+#include "InputManager.h"
 
-struct ImGuiContext;
+struct ImDrawData;
 
 namespace nb {
-class Renderer; class CoreEngine; class InputManager; class Scraper;
+class Renderer; class CoreEngine;
 
-struct LibraryEntry
+struct GameEntry
 {
-    StorageManager::GameEntry game;
-    std::wstring displayName;
-    std::wstring system;          // "SNES", "NES", "GBA"...
-    std::wstring coreId;
-    std::string  boxartUv;        // cached texture key ("game:<hash>")
-    uint64_t     lastPlayed = 0;  // unix seconds
-    int          playCount = 0;
-    float        rating = 0.0f;   // user stars 0..5
+    std::wstring path;
+    std::wstring title;
+    std::wstring system;
+    std::vector<std::wstring> cores;   // candidate core DLL names, in preference order
 };
-
-enum class Screen { Boot, Library, GameDetail, Settings, Netplay, Overlay };
 
 class Dashboard
 {
 public:
-    void Initialize(Renderer* renderer, CoreEngine* engine);
+    enum class Screen { Library, Settings, InGameMenu, Hidden };
+
+    bool Initialize(Renderer* renderer, CoreEngine* engine);
     void Shutdown();
 
-    // One UI frame: consumes the input snapshot, animates, draws.
-    // Called from the UI thread; safe while a core is running (overlay path).
-    void Update(float dtSeconds, const std::vector<struct PadState>& pads);
+    // Builds one UI frame; returns draw data (may be empty when Hidden).
+    ImDrawData* Update(float dt, const PadState& pad);
 
-    void ShowLibrary();
-    void ShowOverlay();
-    void HideOverlay();
-
+    void OpenInGameMenu();
     Screen GetScreen() const { return m_screen; }
-    bool   WantsExitToDashboard() const { return m_wantsExit; }
-    void   ClearWantsExit() { m_wantsExit = false; }
 
 private:
-    void DrawLibrary(float dt);
-    void DrawGameDetail();
+    void FeedGamepad(const PadState& pad);
+    void ScanLibrary();
+    void DrawLibrary();
     void DrawSettings();
-    void DrawOverlay();
-    void DrawBootSplash(float dt);
-    void NavigateGrid(int dx, int dy);
-    void Launch(const LibraryEntry& e);
+    void DrawInGameMenu();
+    void DrawToast(float dt);
+    void Launch(const GameEntry& g);
+    void Toast(const std::wstring& msg, float seconds = 5.0f);
+    bool CoreInstalled(const std::wstring& dll) const;
 
-    Renderer*             m_renderer = nullptr;
-    CoreEngine*           m_engine = nullptr;
-    std::unique_ptr<Scraper> m_scraper;
-
-    std::vector<LibraryEntry> m_library;
-    std::vector<std::wstring> m_systemTabs;   // "" = All
-    int    m_activeTab = 0;
-    int    m_focusX = 0, m_focusY = 0;
-    float  m_focusAnimX = 0, m_focusAnimY = 0; // eased focus position
-    float  m_scrollAnim = 0;
-    Screen m_screen = Screen::Boot;
-    bool   m_wantsExit = false;
-    float  m_bootTimer = 0;
-    bool   m_overlayOpen = false;
-    // Filtered view of the active tab
-    std::vector<int> m_visibleRows;
-    uint64_t m_lastNavFrame = 0;
+    Renderer*   m_renderer = nullptr;
+    CoreEngine* m_engine = nullptr;
+    Screen      m_screen = Screen::Library;
+    std::vector<GameEntry> m_games;
+    std::vector<std::wstring> m_scannedDirs;
+    std::wstring m_coresDir;
+    std::string m_toast;
+    float       m_toastTime = 0.0f;
+    bool        m_focusFirst = true;
+    int         m_stateSlot = 1;
+    uint16_t    m_prevButtons = 0;
 };
 
 } // namespace nb
