@@ -1,28 +1,22 @@
 #pragma once
-// App.h — WinRT lifecycle entry for Xbox Dev Mode (UWP).
-// Owns: IFrameworkView, suspend/resume, visibility, D3D12 swapchain bootstrap,
-//        and the CoreEngine lifetime.
+// App.h — WinRT CoreApplication view for Xbox Dev Mode (UWP).
 #include <windows.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.ApplicationModel.h>
-#include <winrt/Windows.Gaming.Input.h>
-#include <winrt/Windows.Storage.h>
-#include <d3d12.h>
-#include <dxgi1_6.h>
+#include <winrt/Windows.UI.Core.h>
 #include <memory>
 #include <atomic>
 
-#include "CoreEngine.h"
-
 namespace nb
 {
-class Renderer;
+class Renderer; class CoreEngine; class InputManager; class Dashboard;
 
 class App : public winrt::implements<App, winrt::Windows::ApplicationModel::Core::IFrameworkView>
 {
 public:
-    App() = default;
+    App();
+    ~App();
 
     // IFrameworkView
     void Initialize(winrt::Windows::ApplicationModel::Core::CoreApplicationView const&);
@@ -32,24 +26,24 @@ public:
     void Uninitialize();
 
 private:
-    void CreateSwapchain();
-    void OnSuspending(winrt::Windows::ApplicationModel::Core::CoreApplicationView const&,
+    void OnSuspending(winrt::Windows::Foundation::IInspectable const&,
                       winrt::Windows::ApplicationModel::SuspendingEventArgs const&);
-    void OnResuming(winrt::Windows::ApplicationModel::Core::CoreApplicationView const&,
+    void OnResuming(winrt::Windows::Foundation::IInspectable const&,
                     winrt::Windows::Foundation::IInspectable const&);
     void OnVisibilityChanged(winrt::Windows::UI::Core::CoreWindow const&,
                              winrt::Windows::UI::Core::VisibilityChangedEventArgs const&);
-    void OnDpiChanged(winrt::Windows::UI::Core::CoreWindow const&,
-                      winrt::Windows::UI::Core::WindowSizeChangedEventArgs const&);
+    void OnClosed(winrt::Windows::UI::Core::CoreWindow const&,
+                  winrt::Windows::UI::Core::CoreWindowEventArgs const&);
 
     winrt::Windows::UI::Core::CoreWindow m_window{ nullptr };
-    winrt::event_token m_suspendingToken{}, m_resumingToken{}, m_visibilityToken{},
-                       m_dpiToken{};
 
-    std::unique_ptr<Renderer>   m_renderer;
-    std::unique_ptr<CoreEngine> m_engine;
-    std::atomic<bool>           m_visible{ true };
-    std::atomic<bool>           m_running{ true };
+    std::unique_ptr<Renderer>     m_renderer;
+    std::unique_ptr<InputManager> m_input;
+    std::unique_ptr<CoreEngine>   m_engine;
+    std::unique_ptr<Dashboard>    m_dashboard;
+    std::atomic<bool>             m_visible{ true };
+    std::atomic<bool>             m_running{ true };
+    uint16_t                      m_prevButtons = 0;
 };
 
 class AppViewSource : public winrt::implements<AppViewSource,

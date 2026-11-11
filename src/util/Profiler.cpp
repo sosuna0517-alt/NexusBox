@@ -18,7 +18,7 @@ double Profiler::MemMB()
 {
     // UWP AppMemoryReport: usage vs the Dev Mode budget. Series X|S Dev Mode
     // builds get far more RAM than retail; we still guard against termination.
-    auto report = winrt::Windows::System::AppMemoryReport();
+    auto report = winrt::Windows::System::MemoryManager::GetAppMemoryReport();
     const uint64_t usage = report.TotalCommit();
     const uint64_t limit = report.PeakCommitment();
     (void)limit;

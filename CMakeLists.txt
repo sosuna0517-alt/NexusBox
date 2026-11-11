@@ -22,7 +22,7 @@ add_compile_definitions(
     _WIN32_WINNT=0x0A00
     UNICODE _UNICODE
     NEXUSBOX_VERSION_MAJOR=0 NEXUSBOX_VERSION_MINOR=1
-    XB1 ON   # Xbox family target for the Gaming SDK
+    NEXUSBOX_XBOX=1
     _USE_MATH_DEFINES
 )
 # Max optimization for retail Xbox Dev Mode, LTCG, no SEH overhead on hot paths
@@ -39,6 +39,33 @@ endif()
 # in-repo (src/ui/Scraper.cpp uses a hand-rolled reader; src/util/LzCpp.cpp
 # provides state compression). The dashboard UI is built in C++ directly.
 
+file(GLOB NEXUSBOX_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/NexusBox/Assets/*.png)
+# libretro cores (UWP x64 builds) placed in ./cores are packaged into the app.
+file(GLOB NEXUSBOX_CORES ${CMAKE_CURRENT_SOURCE_DIR}/cores/*.dll)
+set(NEXUSBOX_PACKAGE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/NexusBox/Package.appxmanifest
+    ${NEXUSBOX_ASSETS} ${NEXUSBOX_CORES})
+
+# HLSL compiled at build time by FXC into headers (no runtime shader compiler).
+set(NEXUSBOX_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+set(NEXUSBOX_SHADERS
+    src/render/Shaders/BlitVS.hlsl  src/render/Shaders/BlitPS.hlsl
+    src/render/Shaders/ImGuiVS.hlsl src/render/Shaders/ImGuiPS.hlsl)
+foreach(sh ${NEXUSBOX_SHADERS})
+    get_filename_component(name ${sh} NAME_WE)
+    if(name MATCHES "VS$")
+        set(type Vertex)
+    else()
+        set(type Pixel)
+    endif()
+    set_source_files_properties(${sh} PROPERTIES
+        VS_SHADER_TYPE ${type}
+        VS_SHADER_MODEL 5.0
+        VS_SHADER_ENTRYPOINT main
+        VS_SHADER_OUTPUT_HEADER_FILE "${NEXUSBOX_SHADER_DIR}/${name}.h"
+        VS_SHADER_VARIABLE_NAME "g_${name}"
+        VS_SHADER_OBJECT_FILE_NAME "$(OutDir)%(Filename).cso")
+endforeach()
+
 add_executable(NexusBox WIN32
     src/App.cpp
     src/CoreEngine.cpp
@@ -46,13 +73,24 @@ add_executable(NexusBox WIN32
     src/render/Renderer.cpp
     src/audio/AudioEngine.cpp
     src/core/RetroCoreLoader.cpp
-    src/save/SaveStateManager.cpp
-    src/storage/StorageManager.cpp
-    src/net/Netplay.cpp
-    # NexusBox/Package.appxmanifest is added by the VS project / VS generator
+    src/ui/Dashboard.cpp
+    src/util/LzCpp.cpp
+    src/util/Profiler.cpp
+    ${NEXUSBOX_SHADERS}
+    ${NEXUSBOX_PACKAGE_FILES}
 )
+# Not built yet (unfinished): src/net, src/netplay, src/save, src/storage, src/ui/Scraper.
+# Mark assets/cores as package content so the VS generator places them in the .appx
+set_property(SOURCE ${NEXUSBOX_ASSETS} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+set_property(SOURCE ${NEXUSBOX_ASSETS} PROPERTY VS_DEPLOYMENT_LOCATION "Assets")
+if(NEXUSBOX_CORES)
+    set_property(SOURCE ${NEXUSBOX_CORES} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+    set_property(SOURCE ${NEXUSBOX_CORES} PROPERTY VS_DEPLOYMENT_LOCATION "cores")
+endif()
+set_target_properties(NexusBox PROPERTIES VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION "10.0.19041.0")
 
-target_include_directories(NexusBox PRIVATE src)
+target_include_directories(NexusBox PRIVATE src src/render ${NEXUSBOX_SHADER_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libretro)
 
 target_link_libraries(NexusBox PRIVATE
     d3d12.lib dxgi.lib dxguid.lib
@@ -62,29 +100,21 @@ target_link_libraries(NexusBox PRIVATE
     kernel32.lib user32.lib
 )
 
-# ---- Dashboard UI ----------------------------------------------------------
-# ImGui is pure C++ source; fetched as source (no package manager) and compiled
-# into the app. NEXUSBOX_IMGUI=OFF builds without the dashboard overlay.
-option(NEXUSBOX_IMGUI "Build the ImGui dashboard UI" ON)
-if(NEXUSBOX_IMGUI)
-    include(FetchContent)
-    FetchContent_Declare(imgui
-        GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG        v1.91.9b
-        GIT_SHALLOW    TRUE)
-    FetchContent_MakeAvailable(imgui)
-    # Core ImGui only. The desktop backends (imgui_impl_win32 / imgui_impl_dx12)
-    # use APIs missing from the UWP surface (GetKeyboardLayout, TrackMouseEvent,
-    # DwmEnableBlurBehindWindow, ...) and are wrong for Xbox. Platform glue and
-    # DX12 rendering live in our own src/ui/ImguiBackend.*.
-    add_library(imgui STATIC
-        ${imgui_SOURCE_DIR}/imgui.cpp
-        ${imgui_SOURCE_DIR}/imgui_draw.cpp
-        ${imgui_SOURCE_DIR}/imgui_tables.cpp
-        ${imgui_SOURCE_DIR}/imgui_widgets.cpp)
-    target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR}
-        ${imgui_SOURCE_DIR}/backends)
-    target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
-    target_link_libraries(NexusBox PRIVATE imgui)
-    target_compile_definitions(NexusBox PRIVATE NEXUSBOX_HAS_IMGUI)
-endif()
+# ---- Dashboard UI (Dear ImGui, required) ------------------------------------
+# Only the core ImGui sources are compiled. Platform input and D3D12 rendering
+# are implemented by NexusBox itself (src/ui/Dashboard.cpp, src/render/Renderer.cpp)
+# because the desktop imgui_impl_win32 backend does not work on Xbox UWP.
+include(FetchContent)
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.9b
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
+target_link_libraries(NexusBox PRIVATE imgui)
+target_compile_definitions(NexusBox PRIVATE NEXUSBOX_HAS_IMGUI)

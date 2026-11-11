@@ -1,192 +1,221 @@
-// CoreEngine.cpp — deterministic frame dispatch.
-#include "netplay/Netplay.h"
+// CoreEngine.cpp — emulation thread, game load/unload, SRAM and save states.
 #include "CoreEngine.h"
 #include "render/Renderer.h"
 #include "InputManager.h"
 #include "audio/AudioEngine.h"
+#include "util/LzCpp.h"
 
 #include <windows.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.h>
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <cmath>
+#include <fstream>
+#include <iterator>
 
+namespace fs = std::filesystem;
 using namespace std::chrono;
 
 namespace nb
 {
 
-void CoreEngine::Initialize(Renderer* renderer)
+CoreEngine::CoreEngine()  = default;
+CoreEngine::~CoreEngine() { Shutdown(); }
+
+void CoreEngine::Initialize(Renderer* renderer, InputManager* input)
 {
     m_renderer = renderer;
-    m_input    = std::make_unique<InputManager>();
+    m_input    = input;
     m_audio    = std::make_unique<AudioEngine>();
-    m_netplay  = std::make_unique<Netplay>();
-    m_input->Initialize();
-    m_audio->Initialize(48000, 2);
-    m_netplay->Initialize(this);
+    m_audio->Initialize();
+
+    m_localDir = winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path().c_str();
+    std::error_code ec;
+    fs::create_directories(SystemDir(), ec);
+    fs::create_directories(SavesDir(), ec);
+    fs::create_directories(RomsDir(), ec);
+    m_core.SetDirectories(SystemDir(), SavesDir());
 }
 
 void CoreEngine::Start()
 {
+    if (m_runThread) return;
     m_runThread = true;
     m_thread = std::thread([this] { EmulationLoop(); });
-    SetThreadPriority(m_thread.native_handle(), THREAD_PRIORITY_TIME_CRITICAL);
-    SetThreadAffinityMask(m_thread.native_handle(), 0x2); // core 1: keep emulation off core 0 (OS)
+    SetThreadPriority(m_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
 }
 
 void CoreEngine::Shutdown()
 {
     m_runThread = false;
     if (m_thread.joinable()) m_thread.join();
-    UnloadCore();
+    UnloadGame();
+    if (m_audio) m_audio->Shutdown();
 }
 
-bool CoreEngine::LoadCore(const wchar_t* corePath, const wchar_t* romPath)
+bool CoreEngine::LoadGame(const std::wstring& corePath, const std::wstring& romPath, std::wstring& error)
 {
-    if (!m_core.Load(corePath))   return false;
-    if (!m_core.LoadRom(romPath)) return false;
-    m_states.Initialize(m_core.GetMemoryMap());        // SRAM/state arenas registered
-    m_audio->Configure((uint32_t)m_core.AudioRate(), m_core.AudioChannels());
-    Resume();
+    UnloadGame();
+    std::lock_guard lock(m_coreMutex);
+
+    if (!m_core.Load(corePath.c_str(), error)) return false;
+    m_core.SetAudioSink([this](const int16_t* s, size_t frames) { m_audio->WriteFrames(s, frames); });
+    if (!m_core.LoadRom(romPath.c_str(), error)) { m_core.Unload(); return false; }
+
+    m_romPath   = romPath;
+    m_gameTitle = fs::path(romPath).stem().wstring();
+    m_coreName  = m_core.LibraryName();
+    m_audio->Configure((uint32_t)std::lround(m_core.AudioRate()));
+    LoadSram();
+
+    m_hasGame = true;
+    m_mode = Mode::Running;
     return true;
 }
 
-void CoreEngine::UnloadCore()
+void CoreEngine::UnloadGame()
 {
-    m_states.FlushAll();                   // synchronous SRAM write before teardown
+    std::lock_guard lock(m_coreMutex);
+    if (m_hasGame) SaveSram();
+    m_mode = Mode::Dashboard;
+    m_hasGame = false;
     m_core.Unload();
+    if (m_audio) m_audio->Clear();
+    if (m_renderer) m_renderer->ClearVideo();
 }
 
-// ------------------------------------------------------------------ dispatch
+void CoreEngine::Pause()  { if (m_mode == Mode::Running) { m_mode = Mode::Paused; if (m_audio) m_audio->SuspendVoice(); } }
+void CoreEngine::Resume() { if (m_mode == Mode::Paused && m_hasGame) { if (m_audio) { m_audio->Clear(); m_audio->ResumeVoice(); } m_mode = Mode::Running; } }
+
+void CoreEngine::ResetGame()
+{
+    std::lock_guard lock(m_coreMutex);
+    if (m_hasGame) m_core.Reset();
+}
+
+// ------------------------------------------------------------------ emulation thread
 
 void CoreEngine::EmulationLoop()
 {
     using clock = steady_clock;
+    auto next = clock::now();
     auto last = clock::now();
-    uint64_t frame = 0;
 
     while (m_runThread)
     {
-        auto t0 = clock::now();
-        double dtMs = duration<double, std::milli>(t0 - last).count();
-        last = t0;
+        if (m_mode != Mode::Running) { Sleep(5); next = clock::now(); continue; }
 
-        if (m_mode != Mode::Running) { Sleep(4); continue; }
-
-        FrameContext fc;
-        fc.frameIndex = frame++;
-        const auto av = m_core.GetAvInfo();
-        float speed = m_speed.load(std::memory_order_relaxed);
-        fc.targetFps       = av.fps * speed;
-        fc.audioSampleRate = m_core.AudioRate();
-        fc.skipVideo       = speed > 2.0f && (frame & 1); // FF: skip odd blits
-        fc.rewindTick      = m_rewind.load() && ((frame % 2) == 0); // 30Hz rewind granularity
-
-        // 1) Input: seqlock snapshot from the polling thread (never blocks)
-        // Convert pad states to the libretro-facing InputSnapshot.
-        auto pads = m_input->Snapshot(fc.frameIndex);
-        InputSnapshot in{};
-        for (size_t p = 0; p < pads.size() && p < 4; ++p)
         {
-            in.buttons[p] = pads[p].buttons;
-            in.analog[p][0] = pads[p].lx; in.analog[p][1] = pads[p].ly;
-            in.analog[p][2] = pads[p].rx; in.analog[p][3] = pads[p].rt;
-        }
-        m_core.SetInput(in);
+            std::lock_guard lock(m_coreMutex);
+            if (!m_hasGame || m_mode != Mode::Running) continue;
 
-        // 2) Rewind capture (before run, so load-state is one frame of work)
-        if (fc.rewindTick) m_states.CaptureRewind();
+            // 1) Input snapshot -> core
+            const auto pads = m_input->Snapshot(0);
+            InputSnapshot in{};
+            for (int p = 0; p < 4; ++p)
+            {
+                in.buttons[p] = pads[p].buttons;
+                in.lx[p] = pads[p].lx; in.ly[p] = pads[p].ly;
+                in.rx[p] = pads[p].rx; in.ry[p] = pads[p].ry;
+                in.lt[p] = pads[p].lt; in.rt[p] = pads[p].rt;
+            }
+            m_core.SetInput(in);
 
-        // 3) Emulate one video frame (audio sample callbacks stream into XAudio2 ring)
-        m_profiler.BeginCpu();
-        m_core.RunFrame();
-        m_profiler.EndCpu();
+            // 2) Emulate one frame (audio callbacks push into the XAudio2 ring)
+            m_profiler.BeginCpu();
+            m_core.RunFrame();
+            m_profiler.EndCpu();
 
-        // 4) Netplay (rollback resim, if active)
-        m_netplay->OnFrame(fc.frameIndex);
-
-        // 5) Publish: GPU blit is queued, audio already streamed by the core
-        if (!fc.skipVideo)
-        {
-            auto fv = m_core.VideoFrame();
-            VideoFrame vf{ fv.data, fv.pitch, fv.width, fv.height, fv.bpp, fc.frameIndex };
-            const auto av2 = m_core.GetAvInfo();
-            VideoGeometry geo{ fv.width, fv.height, av2.aspect, 0.0f };
-            m_renderer->Blit(vf, geo, fc.frameIndex);
+            // 3) Hand the new frame to the renderer (copied; UI thread presents)
+            if (m_core.ConsumeNewFrame())
+            {
+                const auto fv = m_core.VideoFrame();
+                m_renderer->SubmitVideo((const uint32_t*)fv.data, fv.width, fv.height, m_core.GetAvInfo().aspect);
+            }
         }
 
-        // 6) Drift-free pacing: schedule next tick, never sleep to catch-up
-        SyncPacing(fc.targetFps);
-        m_profiler.EndFrame(dtMs);
+        // 4) Pace to the core's frame rate (fast-forward runs uncapped up to 4x).
+        const double fps = std::clamp(m_core.GetAvInfo().fps, 10.0, 240.0) * (m_fastForward ? 4.0 : 1.0);
+        next += duration_cast<clock::duration>(duration<double>(1.0 / fps));
+        auto now = clock::now();
+        if (next > now)
+        {
+            const auto waitMs = duration<double, std::milli>(next - now).count();
+            if (waitMs > 2.0) Sleep((DWORD)(waitMs - 1.0));
+            while (clock::now() < next) YieldProcessor();
+        }
+        else if (now - next > milliseconds(100))
+        {
+            next = now;   // fell far behind (e.g. after a pause): re-anchor
+        }
+        now = clock::now();
+        m_profiler.EndFrame(duration<double, std::milli>(now - last).count());
+        last = now;
     }
 }
 
-void CoreEngine::SyncPacing(double targetFps)
+// ------------------------------------------------------------------ saves
+
+std::wstring CoreEngine::SramPath() const  { return SavesDir() + L"\\" + m_gameTitle + L".srm"; }
+std::wstring CoreEngine::StatePath(int slot) const
+{ return SavesDir() + L"\\" + m_gameTitle + L".state" + std::to_wstring(slot); }
+
+void CoreEngine::LoadSram()
 {
-    if (targetFps <= 1.0) { Sleep(4); return; }
-    const double stepMs = 1000.0 / targetFps;
-    if (m_nextTickMs <= 0.0)
-    {
-        m_nextTickMs = duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
-    }
-    m_nextTickMs += stepMs;
-    const double nowMs = duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
-    const double wait  = m_nextTickMs - nowMs;
-    if (wait > 0.0)
-    {
-        // Sleep down to 1ms granularity, spin the last fraction for precision.
-        if (wait > 1.5) Sleep(static_cast<DWORD>(wait - 1.0));
-        const double endMs = m_nextTickMs;
-        while (duration<double, std::milli>(steady_clock::now().time_since_epoch()).count() < endMs)
-            YieldProcessor();
-    }
-    else
-    {
-        // Behind: re-anchor, drop the backlog (never burst-run).
-        m_nextTickMs = nowMs;
-    }
+    const MemoryMap mem = m_core.GetMemoryMap();
+    if (!mem.sram || !mem.sramSize) return;
+    std::ifstream f(SramPath(), std::ios::binary);
+    if (f) f.read((char*)mem.sram, (std::streamsize)mem.sramSize);
 }
 
-void CoreEngine::Tick()
+void CoreEngine::SaveSram()
 {
-    // UI-thread tick: poll hotkeys, drive the overlay; the emulation thread
-    // never touches the window system.
-    if (!m_input) return;
-    m_input->ProcessHotkeys(*this);
+    const MemoryMap mem = m_core.GetMemoryMap();
+    if (!mem.sram || !mem.sramSize) return;
+    std::ofstream f(SramPath(), std::ios::binary | std::ios::trunc);
+    if (f) f.write((const char*)mem.sram, (std::streamsize)mem.sramSize);
 }
 
-void CoreEngine::Pause()  { if (m_mode == Mode::Running) m_mode = Mode::Paused;  }
-void CoreEngine::Resume(bool) { if (m_mode == Mode::Paused) m_mode = Mode::Running; }
-
-void CoreEngine::SetFastForward(float speed) { m_speed = std::clamp(speed, 0.1f, 8.0f); }
-void CoreEngine::SetRewindEnabled(bool on)   { m_rewind = on; }
-
-bool CoreEngine::SaveStateNow(int slot)  { return m_states.Save(slot, m_core.Serialize()); }
-bool CoreEngine::LoadStateNow(int slot)
+bool CoreEngine::SaveState(int slot, std::wstring& message)
 {
-    auto blob = m_states.Load(slot);
-    if (!blob) return false;
-    return m_core.Deserialize(*blob);
+    std::lock_guard lock(m_coreMutex);
+    if (!m_hasGame) { message = L"No game running."; return false; }
+    const auto state = m_core.Serialize();
+    if (state.empty()) { message = L"This core does not support save states."; return false; }
+    const auto packed = lz::Compress(state);
+    std::ofstream f(StatePath(slot), std::ios::binary | std::ios::trunc);
+    if (!f) { message = L"Could not write the save state file."; return false; }
+    f.write((const char*)packed.data(), (std::streamsize)packed.size());
+    message = L"Saved state to slot " + std::to_wstring(slot) + L".";
+    return true;
+}
+
+bool CoreEngine::LoadState(int slot, std::wstring& message)
+{
+    std::lock_guard lock(m_coreMutex);
+    if (!m_hasGame) { message = L"No game running."; return false; }
+    std::ifstream f(StatePath(slot), std::ios::binary);
+    if (!f) { message = L"Slot " + std::to_wstring(slot) + L" is empty."; return false; }
+    std::vector<uint8_t> packed((std::istreambuf_iterator<char>(f)), {});
+    std::vector<uint8_t> state;
+    if (!lz::Decompress(packed, state) || !m_core.Deserialize(state))
+    { message = L"The save state could not be loaded."; return false; }
+    message = L"Loaded state from slot " + std::to_wstring(slot) + L".";
+    return true;
 }
 
 void CoreEngine::PrepareForSuspension()
 {
-    // Xbox may kill us shortly after Suspending fires: flush everything now.
-    m_states.FlushAll();
-    m_audio->SuspendVoice();
-    m_mode = Mode::Paused;
+    Pause();
+    std::lock_guard lock(m_coreMutex);
+    if (m_hasGame) SaveSram();
 }
 
 void CoreEngine::OnResume()
 {
-    m_audio->ResumeVoice();
-    m_renderer->HandleDeviceLost();
-    if (m_core.Loaded()) m_mode = Mode::Running;
-}
-
-bool CoreEngine::HandleSystemBack()
-{
-    if (m_mode == Mode::Overlay) { m_mode = Mode::Running; return true; }
-    if (m_mode == Mode::Running) { m_mode = Mode::Overlay;  return true; }
-    return false;
+    // Stay paused; the dashboard overlay lets the player resume.
 }
 
 } // namespace nb
