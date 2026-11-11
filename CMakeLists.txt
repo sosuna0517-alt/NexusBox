@@ -22,7 +22,7 @@ add_compile_definitions(
     _WIN32_WINNT=0x0A00
     UNICODE _UNICODE
     NEXUSBOX_VERSION_MAJOR=0 NEXUSBOX_VERSION_MINOR=1
-    XB1 ON   # Xbox family target for the Gaming SDK
+    NEXUSBOX_XBOX=1
     _USE_MATH_DEFINES
 )
 # Max optimization for retail Xbox Dev Mode, LTCG, no SEH overhead on hot paths
@@ -39,6 +39,9 @@ endif()
 # in-repo (src/ui/Scraper.cpp uses a hand-rolled reader; src/util/LzCpp.cpp
 # provides state compression). The dashboard UI is built in C++ directly.
 
+file(GLOB NEXUSBOX_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/NexusBox/Assets/*.png)
+set(NEXUSBOX_PACKAGE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/NexusBox/Package.appxmanifest ${NEXUSBOX_ASSETS})
+
 add_executable(NexusBox WIN32
     src/App.cpp
     src/CoreEngine.cpp
@@ -48,9 +51,15 @@ add_executable(NexusBox WIN32
     src/core/RetroCoreLoader.cpp
     src/save/SaveStateManager.cpp
     src/storage/StorageManager.cpp
-    src/net/Netplay.cpp
-    # NexusBox/Package.appxmanifest is added by the VS project / VS generator
+    src/netplay/Netplay.cpp        # CoreEngine includes netplay/Netplay.h
+    src/util/LzCpp.cpp             # used by SaveStateManager
+    src/util/Profiler.cpp
+    ${NEXUSBOX_PACKAGE_FILES}
 )
+# Mark manifest/assets so the VS generator produces an .appx package
+set_property(SOURCE ${NEXUSBOX_ASSETS} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+set_property(SOURCE ${NEXUSBOX_ASSETS} PROPERTY VS_DEPLOYMENT_LOCATION "Assets")
+set_target_properties(NexusBox PROPERTIES VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION "10.0.19041.0")
 
 target_include_directories(NexusBox PRIVATE src)
 

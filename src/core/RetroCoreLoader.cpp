@@ -25,9 +25,10 @@ template <typename T> static T sym(HMODULE m, const char* name)
 bool RetroCoreLoader::Load(const wchar_t* corePath)
 {
     Unload();
-    // LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | search application dir | search system32
-    m_module = LoadLibraryExW(corePath, nullptr,
-        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
+    // UWP/Xbox: only DLLs shipped inside the app package can be loaded and
+    // LoadLibraryExW is unavailable. corePath must be package-relative
+    // (e.g. L"cores\\snes9x_libretro.dll") to a core built for UWP x64.
+    m_module = LoadPackagedLibrary(corePath, 0);
     if (!m_module) return false;
     if (!BindSymbols()) { Unload(); return false; }
 
